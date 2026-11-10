@@ -51,9 +51,9 @@ pub fn new_id() -> String {
 }
 
 #[derive(Clone, Debug)]
-struct Record {
-    meta: Meta,
-    state: Map<String, Value>,
+pub(crate) struct Record {
+    pub(crate) meta: Meta,
+    pub(crate) state: Map<String, Value>,
 }
 
 impl Record {
@@ -194,7 +194,12 @@ impl Mailbox {
     }
 
     /// Takes custody: body, then meta and state, durably. False for a known id (nothing written).
-    fn put(&self, meta: Meta, body: &[u8], state: Map<String, Value>) -> io::Result<bool> {
+    pub(crate) fn put(
+        &self,
+        meta: Meta,
+        body: &[u8],
+        state: Map<String, Value>,
+    ) -> io::Result<bool> {
         let mut items = self.items.lock().unwrap();
         let id = meta["id"].as_str().unwrap_or("").to_string();
         if items.contains_key(&id) {
@@ -212,7 +217,7 @@ impl Mailbox {
     }
 
     /// Changes a record's state and stores it durably, as one step.
-    fn modify(
+    pub(crate) fn modify(
         &self,
         id: &str,
         change: impl FnOnce(&mut Map<String, Value>) -> bool,
@@ -230,7 +235,7 @@ impl Mailbox {
         Ok(true)
     }
 
-    fn select(&self, pred: impl Fn(&Record) -> bool) -> Vec<Record> {
+    pub(crate) fn select(&self, pred: impl Fn(&Record) -> bool) -> Vec<Record> {
         let items = self.items.lock().unwrap();
         let mut out: Vec<Record> = items.values().filter(|r| pred(r)).cloned().collect();
         out.sort_by(|a, b| (a.t(), a.meta["id"].as_str()).cmp(&(b.t(), b.meta["id"].as_str())));
@@ -353,7 +358,7 @@ impl Mailbox {
     }
 
     /// The MESSAGE frame of a stored message.
-    fn message_frame(&self, rec: &Record, zlib_level: u32) -> io::Result<Frame> {
+    pub(crate) fn message_frame(&self, rec: &Record, zlib_level: u32) -> io::Result<Frame> {
         let body = self.body(rec.meta["id"].as_str().unwrap_or(""))?;
         let (enc, blob) = frames::encode_payload(&body, zlib_level);
         let mut m = rec.meta.clone();

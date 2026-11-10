@@ -74,6 +74,29 @@ struct Adapter {
     /// The hub under test, with the final checks it reported ("<source>/<stream>" -> result).
     hub: Option<(Hub, Checked)>,
     told: Told,
+    /// Messages told to the hub's application, as the status reports them.
+    hub_inbox: Arc<Mutex<Vec<Value>>>,
+}
+
+/// The hub's application: counts how often each message was told and keeps the first telling.
+fn hub_message_counter(told: &Told, inbox: &Arc<Mutex<Vec<Value>>>) -> mailbox::OnMessage {
+    let (told, inbox) = (told.clone(), inbox.clone());
+    Arc::new(move |meta, body| {
+        let id = meta
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let mut t = told.lock().unwrap();
+        let n = t.entry(id.clone()).or_insert(0);
+        *n += 1;
+        if *n == 1 {
+            inbox.lock().unwrap().push(
+                json!({"id": id, "from": meta.get("from"), "kind": meta.get("kind"),
+                                              "body_hex": hex(body)}),
+            );
+        }
+    })
 }
 
 fn text<'a>(c: &'a Value, key: &str) -> Result<&'a str, String> {
@@ -123,6 +146,9 @@ impl Adapter {
                     .unwrap()
                     .insert(format!("{}/{}", p, s), r.to_string());
             })),
+            on_message: Some(hub_message_counter(&self.told, &self.hub_inbox)),
+            retell: Duration::from_secs(1),
+            segment_bytes: 64 * 1024,
             ..HubOptions::default()
         };
         let hub = Hub::start(
@@ -153,7 +179,7 @@ impl Adapter {
             })
             .collect();
         let out = json!({"running": true, "connected": !sessions.is_empty(), "sessions": sessions, "rejected": null,
-                         "checked": *checked.lock().unwrap(), "told": *self.told.lock().unwrap(), "inbox": [],
+                         "checked": *checked.lock().unwrap(), "told": *self.told.lock().unwrap(), "inbox": *self.hub_inbox.lock().unwrap(),
                          "streams": streams});
         out.as_object().unwrap().clone()
     }
@@ -314,6 +340,7 @@ fn main() {
     let mut adapter = Adapter {
         running: None,
         hub: None,
+        hub_inbox: Arc::new(Mutex::new(Vec::new())),
         told: Arc::new(Mutex::new(BTreeMap::new())),
     };
     let stdout = io::stdout();

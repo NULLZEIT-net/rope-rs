@@ -18,10 +18,11 @@ Early development. **Not yet released.**
 | Messages with custody, recipient | done – exactly once, also through a breaking link and across restarts |
 | Consumer (receives relayed streams) | done – resume, final check, block repair at the consumer |
 | Offline media (sticks), media format 1 | done for source, consumer, recipient – bundles interchangeable with the reference, a stick too small, damaged bundles, block repair by stick |
-| Hub | in progress – sources over TCP, participant list, rejects, one session per participant, block repair; relay to consumers, messages and offline media follow |
+| Hub | over TCP done – participant list, rejects, one session per participant, streams of sources with block repair, relay to consumers, messages with custody and delivery reports; offline media follows |
 
-Conformance: **50 of the 60 scenarios** of the ROPE conformance suite pass – every scenario for the participant
-roles and 15 for the hub; the other 10 test the hub's relay, messages and offline media. The list is in `conformance/expected.txt` and is checked on every change.
+Conformance: **53 of the 60 scenarios** of the ROPE conformance suite pass – every scenario for the participant
+roles and every hub scenario over TCP; the other 7 test the hub's offline media. `tests/end_to_end.rs` runs source,
+hub, consumer and recipient all in Rust. The list is in `conformance/expected.txt` and is checked on every change.
 
 ## Use
 
