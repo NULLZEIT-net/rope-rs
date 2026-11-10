@@ -6,6 +6,7 @@
 //! name is never used as a path (spec 14.4).
 
 use crate::frames::{self, kind, Frame, FrameError};
+use crate::media::{BundleWriter, ImportReport, Skipped};
 use crate::meta;
 use crate::session::{Conn, End};
 use serde_json::{json, Value};
@@ -299,6 +300,125 @@ impl Store {
                         }
                     }
                 }
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+}
+
+impl Store {
+    // --- offline media (spec 8.6) ------------------------------------------------------------------------------
+
+    /// Receipts for a bundle to the sender: `ACK` with what is held, and for every stream whose final check failed
+    /// `STREAM_CHECK` `mismatch` with its `BLOCK_SUMS` (a repair request, as long as the check fails). False when the
+    /// medium is full.
+    pub(crate) fn media_receipts(&mut self, w: &mut BundleWriter) -> io::Result<bool> {
+        for r in self.open.values() {
+            let i = &r.info;
+            if !w.add(&Frame::new(
+                kind::ACK,
+                meta! {"stream" => i.stream, "gen" => i.gen, "committed" => i.committed},
+            ))? {
+                return Ok(false);
+            }
+        }
+        for r in self
+            .open
+            .values()
+            .filter(|r| r.info.verified.as_deref() == Some("mismatch"))
+        {
+            let i = &r.info;
+            let check = meta! {"stream" => i.stream, "gen" => i.gen, "result" => "mismatch", "size" => i.committed};
+            if !w.add(&Frame::new(kind::STREAM_CHECK, check))? {
+                return Ok(false);
+            }
+            let sums = r.block_sums(BLOCK_SIZE)?;
+            let mut first = 0;
+            loop {
+                let part = &sums[first..(first + SUMS_PER_FRAME).min(sums.len())];
+                let m = meta! {"stream" => i.stream, "gen" => i.gen, "block_size" => BLOCK_SIZE, "first" => first, "sums" => part};
+                if !w.add(&Frame::new(kind::BLOCK_SUMS, m))? {
+                    return Ok(false);
+                }
+                first += SUMS_PER_FRAME;
+                if first >= sums.len() {
+                    break;
+                }
+            }
+            w.report.repair_requests += 1;
+        }
+        Ok(true)
+    }
+
+    /// SEGMENT or STREAM_END from a bundle, stored as from the network (spec 8.6): never beyond the committed offset
+    /// (a gap skips the rest of that stream in this bundle), duplicates ignored, a verified stream never changed.
+    /// False for other frames.
+    pub(crate) fn media_frame(
+        &mut self,
+        f: &Frame,
+        rep: &mut ImportReport,
+        skipped: &mut Skipped,
+    ) -> io::Result<bool> {
+        let key = (f.str("stream").to_string(), f.u64("gen"));
+        match f.ftype {
+            kind::SEGMENT => {
+                if skipped.contains(&key) {
+                    return Ok(true);
+                }
+                let off = f.u64("off");
+                let data = match frames::payload(f) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        rep.problems.push(format!(
+                            "stream {} generation {} at byte {}: {} - skipped",
+                            key.0, key.1, off, e.text
+                        ));
+                        skipped.insert(key);
+                        return Ok(true);
+                    }
+                };
+                let repair = f.meta.get("repair").and_then(Value::as_bool) == Some(true);
+                let r = self.get(&key.0, key.1)?;
+                let before = r.info.committed;
+                match r.write(off, &data, repair) {
+                    Ok(committed) => rep.new_bytes += committed - before,
+                    Err(Ok(committed)) => {
+                        rep.problems.push(format!(
+                            "stream {} generation {}: bytes {} to {} are missing here; this bundle starts at byte {} - an \
+                             earlier bundle or the network must bring them first",
+                            key.0, key.1, committed, off, off
+                        ));
+                        skipped.insert(key);
+                    }
+                    Err(Err(e)) => return Err(e),
+                }
+            }
+            kind::STREAM_END => {
+                if skipped.contains(&key) {
+                    return Ok(true);
+                }
+                let r = self.get(&key.0, key.1)?;
+                if r.info.complete {
+                    return Ok(true); // the bundle may be older than a repair over the network
+                }
+                let size = f.u64("size");
+                if r.info.committed < size {
+                    rep.problems.push(format!(
+                        "stream {} generation {}: final check skipped, {} of {} bytes are here",
+                        key.0, key.1, r.info.committed, size
+                    ));
+                    return Ok(true);
+                }
+                let result = r.finish(size, f.str("sha256"))?;
+                if result != "ok" {
+                    rep.problems.push(format!(
+                        "stream {} generation {} differs from the sender's file; the next bundle asks the sender for \
+                         the differing blocks (or the network repairs it, spec 14.7)",
+                        key.0, key.1
+                    ));
+                }
+                rep.checked.push((key.0, key.1, result));
             }
             _ => return Ok(false),
         }

@@ -2,6 +2,7 @@
 //! Stores durably before acknowledging, checks every completed stream, asks for a block repair on a mismatch.
 
 use crate::frames::Frame;
+use crate::media::{ExportReport, ImportReport};
 use crate::participant::{Options, Participant, Role};
 use crate::receiver::{Store, StreamInfo};
 use crate::session::{Conn, End};
@@ -52,6 +53,27 @@ impl Consumer {
     /// Everything received so far, by stream and generation.
     pub fn streams(&self) -> Vec<StreamInfo> {
         self.store.lock().unwrap().streams()
+    }
+
+    /// Writes a bundle for the hub (spec 8.6): receipts for messages, what this consumer holds (`ACK`), repair
+    /// requests for streams whose final check failed, and the outbox.
+    pub fn export_media(&self, medium: &Path, max_bytes: Option<u64>) -> io::Result<ExportReport> {
+        let store = &self.store;
+        self.participant.export_bundle(
+            medium,
+            max_bytes,
+            &mut |w| store.lock().unwrap().media_receipts(w),
+            &mut |_| Ok(true),
+        )
+    }
+
+    /// Imports the hub's bundles for this consumer: relayed streams, final checks, repairs, messages.
+    pub fn import_media(&self, medium: &Path) -> io::Result<Vec<ImportReport>> {
+        let store = &self.store;
+        self.participant
+            .import_bundles(medium, &mut |f, rep, skipped| {
+                store.lock().unwrap().media_frame(f, rep, skipped)
+            })
     }
 }
 

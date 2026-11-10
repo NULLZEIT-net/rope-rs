@@ -7,6 +7,7 @@
 //! Not yet: offline media.
 
 use crate::frames::{self, kind, Frame};
+use crate::media::{collect_repair_frame, BundleWriter, ExportReport, ImportReport};
 use crate::participant::{debug, log, Participant, Role};
 use crate::session::{Conn, End};
 use crate::{meta, now_ms};
@@ -147,13 +148,53 @@ impl SourceStream {
     }
 }
 
+/// Block repairs asked for in bundles: (stream, gen) -> (receiver size, block size, block sums).
+type Repairs = BTreeMap<(String, u64), (u64, u64, Vec<String>)>;
+
 struct Shared {
     streams: BTreeMap<String, SourceStream>,
     saved_at_start: Map<String, Value>,
     state_path: PathBuf,
+    /// Block repairs the hub asked for in a bundle (spec 8.6), kept durably until a bundle carried them:
+    /// (stream, gen) -> (receiver size, block size, block sums).
+    repairs: Repairs,
+    repairs_path: PathBuf,
 }
 
 impl Shared {
+    fn save_repairs(&self) -> io::Result<()> {
+        let list: Vec<Value> = self
+            .repairs
+            .iter()
+            .map(|((n, g), (size, block, sums))| json!({"stream": n, "gen": g, "size": size, "block_size": block, "sums": sums}))
+            .collect();
+        write_json_atomic(&self.repairs_path, &Value::Array(list))
+    }
+
+    fn load_repairs(path: &Path) -> io::Result<Repairs> {
+        let raw = match fs::read(path) {
+            Ok(r) => r,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+            Err(e) => return Err(e),
+        };
+        let v: Value = serde_json::from_slice(&raw)?;
+        Ok(v.as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|r| {
+                let sums = r["sums"]
+                    .as_array()?
+                    .iter()
+                    .map(|s| s.as_str().map(String::from))
+                    .collect::<Option<Vec<_>>>()?;
+                Some((
+                    (r["stream"].as_str()?.to_string(), r["gen"].as_u64()?),
+                    (r["size"].as_u64()?, r["block_size"].as_u64()?, sums),
+                ))
+            })
+            .collect())
+    }
+
     /// Looks at every file's size; writes the state file when it changed.
     fn refresh(&mut self) -> io::Result<()> {
         let mut changed = false;
@@ -182,6 +223,59 @@ impl Shared {
 pub struct Source {
     shared: Arc<Mutex<Shared>>,
     participant: Participant,
+    zlib_level: u32,
+}
+
+/// Raw bytes per segment on a medium (spec 8.6).
+const MEDIA_SEGMENT: u64 = crate::media::SEGMENT_BYTES;
+
+/// Adds the bytes `start`..`limit` of a file as SEGMENT frames, and STREAM_END if `final_size` is set and the stream
+/// is complete up to it. False when the medium is full.
+#[allow(clippy::too_many_arguments)]
+fn add_stream(
+    w: &mut BundleWriter,
+    name: &str,
+    gen: u64,
+    path: &Path,
+    start: u64,
+    limit: u64,
+    final_size: Option<u64>,
+    level: u32,
+) -> io::Result<bool> {
+    let mut off = start;
+    while off < limit {
+        let data = read_range(path, off, MEDIA_SEGMENT.min(limit - off))?;
+        if data.is_empty() {
+            break;
+        }
+        if !w.add(&frames::segment(
+            name,
+            gen,
+            off,
+            &data,
+            now_ms(),
+            level,
+            false,
+        ))? {
+            return Ok(false);
+        }
+        w.report.segments += 1;
+        w.report.stream_bytes += data.len() as u64;
+        off += data.len() as u64;
+    }
+    if let Some(fin) = final_size {
+        if off >= fin {
+            let (digest, n) = sha256_prefix(path, fin)?;
+            let end = Frame::new(
+                kind::STREAM_END,
+                meta! {"stream" => name, "gen" => gen, "size" => n, "sha256" => digest},
+            );
+            if n == fin && !w.add(&end)? {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
 }
 
 impl Deref for Source {
@@ -229,11 +323,15 @@ impl Source {
                 (n, s)
             })
             .collect();
+        let repairs_path = state_dir.join("media_repairs.json");
         let shared = Arc::new(Mutex::new(Shared {
             streams,
             saved_at_start,
             state_path,
+            repairs: Shared::load_repairs(&repairs_path)?,
+            repairs_path,
         }));
+        let zlib_level = opts.zlib_level;
         let role = SourceRole {
             shared: shared.clone(),
             opts: opts.clone(),
@@ -245,7 +343,138 @@ impl Source {
         Ok(Source {
             shared,
             participant,
+            zlib_level,
         })
+    }
+
+    /// Writes a bundle for the hub (spec 8.6): the outbox, block repairs the hub asked for, and every stream not yet
+    /// verified at the hub from what the hub acknowledged (over the network or in a bundle; from 0 after a restart –
+    /// the hub ignores what it holds), with `STREAM_END` once complete. `max_bytes` limits the bundle.
+    pub fn export_media(&self, medium: &Path, max_bytes: Option<u64>) -> io::Result<ExportReport> {
+        let shared = &self.shared;
+        let level = self.zlib_level;
+        let mut repaired = Vec::new();
+        let report =
+            self.participant
+                .export_bundle(medium, max_bytes, &mut |_| Ok(true), &mut |w| {
+                    let mut sh = shared.lock().unwrap();
+                    sh.refresh()?;
+                    let mut ok = true;
+                    let mut dropped = false;
+                    for (key, (size, block, sums)) in sh.repairs.clone() {
+                        let Some(s) = sh.streams.get_mut(&key.0).filter(|s| s.out.gen == key.1)
+                        else {
+                            sh.repairs.remove(&key);
+                            dropped = true;
+                            continue;
+                        };
+                        let diff = differing_blocks(&s.path, block, &sums, size)?;
+                        if !sums.is_empty() && diff.len() * 2 > sums.len() {
+                            // the file was replaced, not edited: a new generation, as on the network (spec 14.7)
+                            s.new_generation(
+                                &key.0,
+                                "changed in most of its blocks (reported in a bundle)",
+                            );
+                            sh.repairs.remove(&key);
+                            sh.save()?;
+                            dropped = true;
+                            continue;
+                        }
+                        for (mut off, end) in diff {
+                            while ok && off < end {
+                                let data = read_range(&s.path, off, MEDIA_SEGMENT.min(end - off))?;
+                                if data.is_empty() {
+                                    break;
+                                }
+                                ok = w.add(&frames::segment(
+                                    &key.0,
+                                    key.1,
+                                    off,
+                                    &data,
+                                    now_ms(),
+                                    level,
+                                    true,
+                                ))?;
+                                if ok {
+                                    w.report.repair_bytes += data.len() as u64;
+                                    off += data.len() as u64;
+                                }
+                            }
+                        }
+                        if !ok {
+                            break;
+                        }
+                        repaired.push(key);
+                    }
+                    if dropped {
+                        sh.save_repairs()?;
+                    }
+                    for (name, s) in sh.streams.iter() {
+                        let o = &s.out;
+                        if !ok || o.result.as_deref() == Some("ok") {
+                            continue;
+                        }
+                        let limit = o.final_size.unwrap_or(o.size);
+                        ok = add_stream(
+                            w,
+                            name,
+                            o.gen,
+                            &s.path,
+                            o.acked.min(limit),
+                            limit,
+                            o.final_size,
+                            level,
+                        )?;
+                    }
+                    Ok(ok)
+                })?;
+        if !repaired.is_empty() {
+            // carried by a bundle: forget them; if that bundle never arrives, the hub asks again
+            let mut sh = self.shared.lock().unwrap();
+            for k in repaired {
+                sh.repairs.remove(&k);
+            }
+            sh.save_repairs()?;
+        }
+        Ok(report)
+    }
+
+    /// Imports the hub's bundles for this source: what the hub holds (`ACK`: the next bundle starts there), repair
+    /// requests, messages and delivery reports.
+    pub fn import_media(&self, medium: &Path) -> io::Result<Vec<ImportReport>> {
+        let shared = &self.shared;
+        let mut requests = BTreeMap::new();
+        let reports = self.participant.import_bundles(medium, &mut |f, rep, _| {
+            if f.ftype == kind::ACK {
+                let (name, gen, committed) = (
+                    f.str("stream").to_string(),
+                    f.u64("gen"),
+                    f.u64("committed"),
+                );
+                if let Some(s) = shared
+                    .lock()
+                    .unwrap()
+                    .streams
+                    .get_mut(&name)
+                    .filter(|s| s.out.gen == gen)
+                {
+                    s.out.acked = s.out.acked.max(committed);
+                }
+                rep.acks.push((name, gen, committed));
+                return Ok(true);
+            }
+            Ok(collect_repair_frame(f, &mut requests))
+        })?;
+        let complete: Vec<_> = requests
+            .into_iter()
+            .filter_map(|(k, r)| r.complete_sums().map(|s| (k, (r.size, r.block_size, s))))
+            .collect();
+        if !complete.is_empty() {
+            let mut sh = self.shared.lock().unwrap();
+            sh.repairs.extend(complete);
+            sh.save_repairs()?;
+        }
+        Ok(reports)
     }
 
     /// Sends one more file from now on. A name known from an earlier run continues where the hub left off; a name

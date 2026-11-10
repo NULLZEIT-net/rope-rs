@@ -17,12 +17,11 @@ Early development. **Not yet released.**
 | Source (sends growing files to a hub) | done – resume, heartbeat, final check, block repair, new generations |
 | Messages with custody, recipient | done – exactly once, also through a breaking link and across restarts |
 | Consumer (receives relayed streams) | done – resume, final check, block repair at the consumer |
-| Offline media (sticks) | planned |
-| Hub | later – the hub stays the Python reference until the participant roles pass the suite |
+| Offline media (sticks), media format 1 | done for source, consumer, recipient – bundles interchangeable with the reference, a stick too small, damaged bundles, block repair by stick |
+| Hub | next – until then the hub is the Python reference |
 
-Conformance: **22 of the 57 scenarios** (3 more for the consumer pass and will be required once they are in the
-suite, rope#55) of the ROPE conformance suite pass; the list is in
-`conformance/expected.txt` and is checked on every change.
+Conformance: **35 of the 60 scenarios** of the ROPE conformance suite pass – every scenario for the participant
+roles; the other 25 test a hub. The list is in `conformance/expected.txt` and is checked on every change.
 
 ## Use
 
