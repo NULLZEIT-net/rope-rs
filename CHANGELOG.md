@@ -6,6 +6,12 @@ The wire protocol has its own number (`PROTOCOL_VERSION`, spec 14.5).
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-10
+
+First version: every role of the protocol, validated against the Python reference with the whole conformance suite
+(60 of 60 scenarios). Wire format: `PROTOCOL_VERSION` 1, media format 1. Not published on crates.io; not yet used
+outside tests. Not included: TLS, names and stream patterns in the hub's participant list.
+
 ### Added
 - Frame codec of the wire format (spec 14): encode, incremental decoder with the length limits checked before
   buffering, validation of every core frame type, zlib payloads bounded to `len` + 1 bytes. All test vectors of the
