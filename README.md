@@ -16,11 +16,12 @@ Early development. **Not yet released.**
 | Frame codec (spec 14) | done – every test vector of the reference passes, byte-exact |
 | Source (sends growing files to a hub) | done – resume, heartbeat, final check, block repair, new generations |
 | Messages with custody, recipient | done – exactly once, also through a breaking link and across restarts |
-| Consumer (receives relayed streams) | planned |
+| Consumer (receives relayed streams) | done – resume, final check, block repair at the consumer |
 | Offline media (sticks) | planned |
 | Hub | later – the hub stays the Python reference until the participant roles pass the suite |
 
-Conformance: **21 of the 57 scenarios** of the ROPE conformance suite pass; the list is in
+Conformance: **22 of the 57 scenarios** (3 more for the consumer pass and will be required once they are in the
+suite, rope#55) of the ROPE conformance suite pass; the list is in
 `conformance/expected.txt` and is checked on every change.
 
 ## Use

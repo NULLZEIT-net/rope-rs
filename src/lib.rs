@@ -2,12 +2,14 @@
 //!
 //! An independent implementation of the specification in the `rope` repository (`docs/spec.md`), tested against the
 //! Python reference with its conformance suite (`rope/conformance/`). So far: the frame codec ([`frames`]), messages
-//! with custody ([`mailbox`], for every participant), the source role ([`source`]) and the recipient
-//! ([`recipient`]).
+//! with custody ([`mailbox`], for every participant), the source role ([`source`]), the consumer
+//! ([`consumer`], storing in [`receiver`]) and the recipient ([`recipient`]).
 
+pub mod consumer;
 pub mod frames;
 pub mod mailbox;
 pub mod participant;
+pub mod receiver;
 pub mod recipient;
 pub mod session;
 pub mod source;
