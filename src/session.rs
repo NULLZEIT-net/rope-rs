@@ -64,7 +64,8 @@ impl Conn {
         Err(last)
     }
 
-    fn from_stream(stream: TcpStream, timeout: Duration) -> io::Result<Conn> {
+    /// Wraps an accepted connection (the hub's side).
+    pub fn from_stream(stream: TcpStream, timeout: Duration) -> io::Result<Conn> {
         stream.set_nodelay(true)?;
         let mut read_side = stream.try_clone()?;
         let (tx, rx) = mpsc::channel();

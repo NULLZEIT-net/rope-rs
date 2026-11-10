@@ -8,6 +8,7 @@
 //! Implemented so far: source and recipient, messages. Other commands answer `"ok": false`.
 
 use rope_protocol::consumer::Consumer;
+use rope_protocol::hub::{Hub, HubOptions};
 use rope_protocol::participant::{Options, Participant};
 use rope_protocol::source::Source;
 use rope_protocol::{mailbox, recipient};
@@ -65,8 +66,13 @@ impl Running {
     }
 }
 
+/// Final checks a hub reported: "<source>/<stream>" -> result.
+type Checked = Arc<Mutex<BTreeMap<String, String>>>;
+
 struct Adapter {
     running: Option<Running>,
+    /// The hub under test, with the final checks it reported ("<source>/<stream>" -> result).
+    hub: Option<(Hub, Checked)>,
     told: Told,
 }
 
@@ -93,11 +99,74 @@ impl Adapter {
         if let Some(mut r) = self.running.take() {
             r.stop();
         }
+        if let Some((mut h, _)) = self.hub.take() {
+            h.stop();
+        }
+    }
+
+    fn start_hub(&mut self, c: &Value) -> Result<Map<String, Value>, String> {
+        self.stop();
+        let participants: BTreeMap<String, String> = c["participants"]
+            .as_object()
+            .ok_or("missing participants")?
+            .iter()
+            .map(|(p, r)| (p.clone(), r.as_str().unwrap_or("").to_string()))
+            .collect();
+        let checked = Arc::new(Mutex::new(BTreeMap::new()));
+        let ck = checked.clone();
+        let opts = HubOptions {
+            port: c["port"].as_u64().unwrap_or(0) as u16,
+            heartbeat: Duration::from_secs_f64(c["heartbeat_s"].as_f64().unwrap_or(0.2)),
+            timeout: Duration::from_secs_f64(c["timeout_s"].as_f64().unwrap_or(1.0)),
+            on_stream_checked: Some(Arc::new(move |p, s, _g, r| {
+                ck.lock()
+                    .unwrap()
+                    .insert(format!("{}/{}", p, s), r.to_string());
+            })),
+            ..HubOptions::default()
+        };
+        let hub = Hub::start(
+            &PathBuf::from(text(c, "dir")?),
+            participants,
+            text(c, "operation")?,
+            opts,
+        )
+        .map_err(|e| e.to_string())?;
+        let port = hub.port();
+        self.hub = Some((hub, checked));
+        Ok(json!({"port": port}).as_object().unwrap().clone())
+    }
+
+    fn hub_status(
+        &self,
+        hub: &Hub,
+        checked: &Mutex<BTreeMap<String, String>>,
+    ) -> Map<String, Value> {
+        let sessions = hub.sessions();
+        let streams: Vec<Value> = hub
+            .streams()
+            .iter()
+            .map(|s| {
+                json!({"participant": s.participant, "stream": s.info.stream, "gen": s.info.gen,
+                       "committed": s.info.committed, "complete": s.info.complete,
+                       "verified": s.info.verified, "path": s.info.path})
+            })
+            .collect();
+        let out = json!({"running": true, "connected": !sessions.is_empty(), "sessions": sessions, "rejected": null,
+                         "checked": *checked.lock().unwrap(), "told": *self.told.lock().unwrap(), "inbox": [],
+                         "streams": streams});
+        out.as_object().unwrap().clone()
     }
 
     fn handle(&mut self, c: &Value) -> Result<Map<String, Value>, String> {
         let cmd = c["cmd"].as_str().unwrap_or("");
         let dir = || text(c, "dir").map(PathBuf::from);
+        if cmd == "start_hub" {
+            return self.start_hub(c);
+        }
+        if let (Some((hub, checked)), "status") = (&self.hub, cmd) {
+            return Ok(self.hub_status(hub, checked));
+        }
         match cmd {
             "start_source" => {
                 self.stop();
@@ -244,6 +313,7 @@ impl Adapter {
 fn main() {
     let mut adapter = Adapter {
         running: None,
+        hub: None,
         told: Arc::new(Mutex::new(BTreeMap::new())),
     };
     let stdout = io::stdout();
