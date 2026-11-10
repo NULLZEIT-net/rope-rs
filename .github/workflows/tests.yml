@@ -1,0 +1,39 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      # the conformance suite and the test vectors come from the Python reference
+      - uses: actions/checkout@v7
+        with:
+          repository: NULLZEIT-net/rope
+          path: rope
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Unit tests and test vectors
+        run: cargo test
+      - name: Test vectors are those of the reference
+        run: python -c "import sys; sys.exit(open('tests/vectors/frames.json','rb').read() != open('rope/docs/vectors/frames.json','rb').read())"
+      - name: Build the adapter
+        run: cargo build --release
+      - name: Conformance suite (scenarios in conformance/expected.txt)
+        run: python conformance/run.py --rope rope

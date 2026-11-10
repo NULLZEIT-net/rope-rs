@@ -1,0 +1,23 @@
+# Scenarios of the ROPE conformance suite (rope/conformance/README.md) that this implementation passes.
+# conformance/run.py fails if one of them does not pass. Add a scenario here when its feature is done.
+
+# source over TCP
+source_basic
+source_disconnects
+source_restart
+source_repair
+source_new_generation
+reject_unknown
+reject_wrong_operation
+reject_role
+
+# frame level, against a scripted hub
+frame_hello
+frame_bad_wrong_crc
+frame_bad_wrong_magic
+frame_bad_meta_too_long
+frame_bad_meta_not_an_object
+frame_bad_ack_without_committed
+frame_unknown_core_type
+frame_extension_ignored
+frame_reject_announced
