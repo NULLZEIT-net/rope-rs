@@ -78,6 +78,10 @@ pub struct Rejected {
 /// The role-specific part of a session.
 pub(crate) trait Role: Send + 'static {
     fn role(&self) -> &'static str;
+    /// What this participant holds as a receiver, for `HELLO.have` (spec 14.5); empty for a pure source.
+    fn have(&mut self) -> Vec<Value> {
+        Vec::new()
+    }
     /// The session is active; `have`: what the hub holds from this participant (`WELCOME.have`).
     fn start_session(&mut self, have: HashMap<(String, u64), u64>) -> Result<(), End>;
     /// A frame from the hub; false if the role does not take it.
@@ -285,7 +289,7 @@ impl Running {
         c.send(&Frame::new(
             kind::HELLO,
             meta! {"participant" => cfg.participant, "operation" => cfg.operation, "role" => role.role(),
-                   "versions" => [PROTOCOL_VERSION], "t" => now_ms(), "have" => Vec::<Value>::new()},
+                   "versions" => [PROTOCOL_VERSION], "t" => now_ms(), "have" => role.have()},
         ))?;
         let first = c.recv(cfg.opts.timeout)?;
         if first.ftype == kind::REJECT {

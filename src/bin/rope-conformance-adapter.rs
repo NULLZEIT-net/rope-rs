@@ -7,6 +7,7 @@
 //!
 //! Implemented so far: source and recipient, messages. Other commands answer `"ok": false`.
 
+use rope_protocol::consumer::Consumer;
 use rope_protocol::participant::{Options, Participant};
 use rope_protocol::source::Source;
 use rope_protocol::{mailbox, recipient};
@@ -43,6 +44,7 @@ fn options(told: &Told) -> Options {
 
 enum Running {
     Source(Source),
+    Consumer(Consumer),
     Other(Participant),
 }
 
@@ -50,12 +52,14 @@ impl Running {
     fn participant(&self) -> &Participant {
         match self {
             Running::Source(s) => s,
+            Running::Consumer(c) => c,
             Running::Other(p) => p,
         }
     }
     fn stop(&mut self) {
         match self {
             Running::Source(s) => s.stop(),
+            Running::Consumer(c) => c.stop(),
             Running::Other(p) => p.stop(),
         }
     }
@@ -112,6 +116,18 @@ impl Adapter {
                 )
                 .map_err(|e| e.to_string())?;
                 self.running = Some(Running::Source(s));
+            }
+            "start_consumer" => {
+                self.stop();
+                let p = Consumer::start(
+                    text(c, "participant")?,
+                    text(c, "operation")?,
+                    text(c, "hub")?,
+                    &dir()?,
+                    options(&self.told),
+                )
+                .map_err(|e| e.to_string())?;
+                self.running = Some(Running::Consumer(p));
             }
             "start_recipient" => {
                 self.stop();
@@ -177,8 +193,20 @@ impl Adapter {
                 .map(|m| json!({"id": m.id, "from": m.from, "kind": m.kind, "body_hex": hex(&p.message_body(&m.id).unwrap_or_default())}))
                 .collect();
             out["inbox"] = json!(inbox);
-            if let Running::Source(s) = r {
-                out["checked"] = json!(s.checked());
+            match r {
+                Running::Source(s) => out["checked"] = json!(s.checked()),
+                Running::Consumer(c) => {
+                    let streams: Vec<Value> = c
+                        .streams()
+                        .iter()
+                        .map(|s| {
+                            json!({"stream": s.stream, "gen": s.gen, "committed": s.committed,
+                                   "verified": s.verified, "path": s.path})
+                        })
+                        .collect();
+                    out["streams"] = json!(streams);
+                }
+                Running::Other(_) => {}
             }
         }
         match out {

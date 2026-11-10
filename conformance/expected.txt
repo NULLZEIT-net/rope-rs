@@ -11,6 +11,10 @@ reject_unknown
 reject_wrong_operation
 reject_role
 
+# consumer over TCP (consumer_disconnects, consumer_restart, consumer_repair pass as well; they go in here once
+# rope#55 adds them to the suite)
+consumer_relay
+
 # messages with custody (source and recipient)
 message_to_adapter
 message_from_adapter

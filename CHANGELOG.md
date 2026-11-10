@@ -19,7 +19,12 @@ The wire protocol has its own number (`PROTOCOL_VERSION`, spec 14.5).
   flight, before stream data; the application is told once per message (`on_message`) and once per new delivery
   report (`on_delivery`), also across a restart. `Participant::send_message`, `inbox`, `outbox`.
 - Recipient role (`recipient::start`): messages only.
-- Conformance adapter (`rope-conformance-adapter`) and `conformance/run.py`: 21 scenarios of the ROPE conformance
-  suite pass (source over TCP, messages both ways also through a breaking link, rejects, frame level).
+- Consumer role (`Consumer::start`, `receiver`): stores relayed streams durably before `ACK`, asks for a gap with
+  `RESEND`, reports what it holds in `HELLO.have`, final check with SHA-256, `BLOCK_SUMS` on a mismatch and repair
+  segments below the committed offset; after a crash, bytes written but never committed are cut off. A stream name
+  is never used as a path.
+- Conformance adapter (`rope-conformance-adapter`) and `conformance/run.py`: 22 scenarios of the ROPE conformance
+  suite are required (source and consumer over TCP, messages both ways also through a breaking link, rejects, frame
+  level).
 - Dependencies: `serde_json`, `crc32fast`, `sha2`, `flate2` (pure-Rust backend) – JSON, CRC-32, SHA-256 and zlib are
   not in the Rust standard library.
