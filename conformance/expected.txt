@@ -11,6 +11,12 @@ reject_unknown
 reject_wrong_operation
 reject_role
 
+# messages with custody (source and recipient)
+message_to_adapter
+message_from_adapter
+messages_to_adapter_disconnects
+messages_from_adapter_disconnects
+
 # frame level, against a scripted hub
 frame_hello
 frame_bad_wrong_crc

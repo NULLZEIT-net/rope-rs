@@ -1,10 +1,14 @@
 //! ROPE – Resumable Offline Protocol for Emergencies, in Rust.
 //!
 //! An independent implementation of the specification in the `rope` repository (`docs/spec.md`), tested against the
-//! Python reference with its conformance suite (`rope/conformance/`). So far: the frame codec ([`frames`]) and the
-//! source role ([`source`]).
+//! Python reference with its conformance suite (`rope/conformance/`). So far: the frame codec ([`frames`]), messages
+//! with custody ([`mailbox`], for every participant), the source role ([`source`]) and the recipient
+//! ([`recipient`]).
 
 pub mod frames;
+pub mod mailbox;
+pub mod participant;
+pub mod recipient;
 pub mod session;
 pub mod source;
 

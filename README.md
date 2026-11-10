@@ -15,11 +15,12 @@ Early development. **Not yet released.**
 |---|---|
 | Frame codec (spec 14) | done – every test vector of the reference passes, byte-exact |
 | Source (sends growing files to a hub) | done – resume, heartbeat, final check, block repair, new generations |
-| Messages, consumer, recipient | planned |
+| Messages with custody, recipient | done – exactly once, also through a breaking link and across restarts |
+| Consumer (receives relayed streams) | planned |
 | Offline media (sticks) | planned |
 | Hub | later – the hub stays the Python reference until the participant roles pass the suite |
 
-Conformance: **17 of the 57 scenarios** of the ROPE conformance suite pass; the list is in
+Conformance: **21 of the 57 scenarios** of the ROPE conformance suite pass; the list is in
 `conformance/expected.txt` and is checked on every change.
 
 ## Use
@@ -40,6 +41,10 @@ let mut source = Source::start(
 source.complete("rec-0001.dat");                    // the file is finished: final check
 source.stop();
 ```
+
+Every participant sends and receives messages: `source.send_message(&["tablet".into()], "note", b"...")`, received
+ones arrive through `Options::on_message` and in `inbox()`. A participant for messages only is started with
+`rope_protocol::recipient::start`.
 
 The source only reads the files – briefly, without locks – and keeps at most 8 unacknowledged segments in memory.
 After a break it continues from what the hub holds.
