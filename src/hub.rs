@@ -1,22 +1,26 @@
 //! The hub (spec 7, 8.1, 14.5, 14.10): checks every greeting against its participant list, keeps one session per
-//! participant, stores the streams of sources durably and checks them.
+//! participant, stores the streams of sources durably and checks them, relays them to consumers and takes custody
+//! of messages (spec 8.5): delivers them to every recipient on its list, reports delivery to the sender, and hands
+//! messages addressed to the hub itself to its application.
 //!
-//! So far: sources over TCP. Not yet: relay to consumers, messages, offline media.
+//! Not yet: offline media.
 
-use crate::frames::{self, kind, Frame, FrameError};
+use crate::frames::{self, kind, Frame, FrameError, Meta};
+use crate::mailbox::{Mailbox, OnMessage, WINDOW};
 use crate::participant::{debug, log};
 use crate::receiver::{Store, StreamInfo};
+use crate::sender::{is_sender_frame, OutStream, Sender};
 use crate::session::{Conn, End};
 use crate::{meta, now_ms, PROTOCOL_VERSION};
-use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap};
+use serde_json::{json, Map, Value};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Called after the final check of a source's stream: (source, stream, gen, "ok" | "mismatch").
 pub type OnStreamChecked = Arc<dyn Fn(&str, &str, u64, &str) + Send + Sync>;
@@ -34,6 +38,14 @@ pub struct HubOptions {
     pub heartbeat: Duration,
     pub timeout: Duration,
     pub on_stream_checked: Option<OnStreamChecked>,
+    /// Messages addressed to the hub itself (`to` contains its identifier) go to its application (spec 8.5).
+    pub on_message: Option<OnMessage>,
+    /// A message to the hub that was not told yet (a restart in between) is told again after this time.
+    pub retell: Duration,
+    /// Relay to consumers: stream data per segment, unacknowledged segments in flight, zlib level.
+    pub segment_bytes: u64,
+    pub window: usize,
+    pub zlib_level: u32,
 }
 
 impl Default for HubOptions {
@@ -45,6 +57,11 @@ impl Default for HubOptions {
             heartbeat: Duration::from_secs(2),
             timeout: Duration::from_secs(10),
             on_stream_checked: None,
+            on_message: None,
+            retell: Duration::from_secs(10),
+            segment_bytes: 256 * 1024,
+            window: 8,
+            zlib_level: 1,
         }
     }
 }
@@ -72,6 +89,10 @@ struct Inner {
     threads: Mutex<Vec<JoinHandle<()>>>,
     next_session: AtomicU64,
     stop: AtomicBool,
+    /// Messages in the hub's custody, with the state of every recipient.
+    messages: Mailbox,
+    /// Messages to the hub told in this run (noted at once; the flag on disk follows).
+    hub_told: Mutex<HashSet<String>>,
 }
 
 /// A running hub. Stops with [`Hub::stop`] (or when dropped); its state stays on disk, so a hub started again on the
@@ -142,8 +163,11 @@ impl Hub {
             threads: Mutex::new(Vec::new()),
             next_session: AtomicU64::new(1),
             stop: AtomicBool::new(false),
+            messages: Mailbox::open(&root.join("messages"), "hub", None, None)?,
+            hub_told: Mutex::new(HashSet::new()),
         });
-        // open what earlier runs stored, so that the hub reports it from the start
+        inner.retell(); // messages to the hub not taken before a restart
+                        // open what earlier runs stored, so that the hub reports it from the start
         for (p, role) in &inner.participants {
             if role == "source" {
                 inner.store(p)?;
@@ -280,6 +304,71 @@ impl Inner {
         None
     }
 
+    /// State of a new message at the hub: known recipients pending, the hub itself delivered (its application
+    /// gets the message), the others unknown (spec 8.5).
+    fn custody_state(&self, sender: &str, to: &[String]) -> Map<String, Value> {
+        let mut seen = HashSet::new();
+        let to: Vec<&String> = to.iter().filter(|t| seen.insert(t.as_str())).collect();
+        let hub = &self.opts.hub_id;
+        let pending: Vec<&String> = to
+            .iter()
+            .copied()
+            .filter(|t| self.participants.contains_key(*t) && *t != sender)
+            .collect();
+        let unknown: Vec<&String> = to
+            .iter()
+            .copied()
+            .filter(|t| !self.participants.contains_key(*t) && *t != hub)
+            .collect();
+        let to_hub = to.contains(&hub);
+        let mut st = Map::new();
+        st.insert("pending".into(), json!(pending));
+        st.insert(
+            "delivered".into(),
+            json!(if to_hub { vec![hub.clone()] } else { vec![] }),
+        );
+        st.insert("unknown".into(), json!(unknown));
+        if to_hub {
+            st.insert("hub_told".into(), json!(false)); // until the application has taken it
+        }
+        st
+    }
+
+    /// Hands a message addressed to the hub to the application, once per run; noted as told afterwards (at least
+    /// once across restarts: the application treats messages by their id, spec 8.5).
+    fn to_hub(&self, meta: &Meta) {
+        let hub = self.opts.hub_id.as_str();
+        let addressed = meta["to"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|x| x.as_str() == Some(hub)));
+        let id = meta["id"].as_str().unwrap_or("").to_string();
+        let Some(cb) = &self.opts.on_message else {
+            return;
+        };
+        if !addressed || self.hub_told.lock().unwrap().contains(&id) {
+            return;
+        }
+        let Ok(body) = self.messages.body(&id) else {
+            return;
+        };
+        cb(meta, &body);
+        self.hub_told.lock().unwrap().insert(id.clone());
+        let _ = self.messages.modify(&id, |st| {
+            st.insert("hub_told".into(), json!(true));
+            true
+        });
+    }
+
+    /// Tells the application every message to the hub it has not taken yet.
+    fn retell(&self) {
+        for rec in self
+            .messages
+            .select(|r| r.state.get("hub_told").and_then(Value::as_bool) == Some(false))
+        {
+            self.to_hub(&rec.meta);
+        }
+    }
+
     fn participant_list(&self) -> Value {
         let mut list =
             vec![json!({"participant": self.opts.hub_id, "name": self.opts.hub_id, "role": "hub"})];
@@ -293,7 +382,12 @@ impl Inner {
 }
 
 fn accept_loop(listener: TcpListener, inner: Arc<Inner>) {
+    let mut last_retell = Instant::now();
     while !inner.stop.load(Ordering::SeqCst) {
+        if last_retell.elapsed() >= inner.opts.retell {
+            inner.retell();
+            last_retell = Instant::now();
+        }
         match listener.accept() {
             Ok((socket, _)) => {
                 let i = inner.clone();
@@ -403,6 +497,13 @@ fn greet_and_serve(
                "have" => have, "participants" => inner.participant_list()},
     ))?;
     let (heartbeat, timeout) = (inner.opts.heartbeat, inner.opts.timeout);
+    let mut session = Session {
+        participant: participant.clone(),
+        store,
+        relay: (role == "consumer").then(|| Relay::new(&hello, &inner.opts)),
+        mail_inflight: HashSet::new(),
+        report_inflight: HashSet::new(),
+    };
     loop {
         if inner.stop.load(Ordering::SeqCst) {
             return Ok(());
@@ -413,69 +514,336 @@ fn greet_and_serve(
                 timeout.as_secs_f64()
             )));
         }
-        let until_beat = heartbeat.saturating_sub(c.last_sent.elapsed());
-        if let Some(f) =
-            c.recv_wait(until_beat.clamp(Duration::from_millis(1), Duration::from_millis(100)))?
-        {
-            handle_frame(&f, c, inner, &participant, store.as_ref())?;
+        while let Some(f) = c.try_recv()? {
+            session.handle(&f, c, inner)?;
+        }
+        // messages before stream data (spec 8.5)
+        let mut progressed = session.send_mail(c, inner)?;
+        if let Some(r) = session.relay.as_mut() {
+            progressed |= r.work(c, inner)?;
         }
         if c.last_sent.elapsed() >= heartbeat {
             c.send(&Frame::new(kind::HEARTBEAT, meta! {"t" => now_ms()}))?;
         }
+        if !progressed {
+            let until_beat = heartbeat.saturating_sub(c.last_sent.elapsed());
+            if let Some(f) =
+                c.recv_wait(until_beat.clamp(Duration::from_millis(1), Duration::from_millis(50)))?
+            {
+                session.handle(&f, c, inner)?;
+            }
+        }
     }
 }
 
-fn handle_frame(
-    f: &Frame,
-    c: &mut Conn,
-    inner: &Inner,
-    participant: &str,
-    store: Option<&Arc<Mutex<Store>>>,
-) -> Result<(), End> {
-    match f.ftype {
-        kind::SEGMENT | kind::STREAM_END if store.is_some() => {
-            let name = format!("{}/{}", participant, f.str("stream"));
-            if name.len() > 255 {
-                return Err(End::Bad(FrameError::new(
-                    "bad_frame",
-                    format!("stream name {:?} is too long to relay: at most 255 bytes including the source identifier and '/'", f.str("stream")),
-                )));
+/// The hub's side of one participant's session.
+struct Session {
+    participant: String,
+    /// The store of a source.
+    store: Option<Arc<Mutex<Store>>>,
+    /// The streams relayed to a consumer.
+    relay: Option<Relay>,
+    /// Messages sent to this participant and not yet acknowledged.
+    mail_inflight: HashSet<String>,
+    /// Delivery reports sent to this participant and not yet acknowledged.
+    report_inflight: HashSet<String>,
+}
+
+impl Session {
+    fn handle(&mut self, f: &Frame, c: &mut Conn, inner: &Inner) -> Result<(), End> {
+        let participant = self.participant.as_str();
+        match f.ftype {
+            kind::SEGMENT | kind::STREAM_END if self.store.is_some() => {
+                let name = format!("{}/{}", participant, f.str("stream"));
+                if name.len() > 255 {
+                    return Err(End::Bad(FrameError::new(
+                        "bad_frame",
+                        format!(
+                            "stream name {:?} is too long to relay: at most 255 bytes including the source identifier and '/'",
+                            f.str("stream")
+                        ),
+                    )));
+                }
+                let mut s = self.store.as_ref().unwrap().lock().unwrap();
+                s.handle(f, c)?;
+                if f.ftype == kind::STREAM_END {
+                    let result = s
+                        .streams()
+                        .into_iter()
+                        .find(|i| i.stream == f.str("stream") && i.gen == f.u64("gen"))
+                        .and_then(|i| i.verified);
+                    drop(s);
+                    if let (Some(cb), Some(r)) = (&inner.opts.on_stream_checked, result) {
+                        cb(participant, f.str("stream"), f.u64("gen"), &r);
+                    }
+                }
+                Ok(())
             }
-            let store = store.unwrap();
-            let mut s = store.lock().unwrap();
-            s.handle(f, c)?;
-            if f.ftype == kind::STREAM_END {
-                let result = s
-                    .streams()
+            t if is_sender_frame(t) && self.relay.is_some() => {
+                self.relay.as_mut().unwrap().handle(f);
+                Ok(())
+            }
+            kind::MESSAGE => {
+                // the hub takes custody only of messages written by the participant of this connection (spec 14.10)
+                if f.str("from") != participant {
+                    return Err(End::Bad(FrameError::new(
+                        "bad_frame",
+                        format!("{} sent a message from {}", participant, f.str("from")),
+                    )));
+                }
+                let body = frames::payload(f)?;
+                let to: Vec<String> = f.meta["to"]
+                    .as_array()
                     .into_iter()
-                    .find(|i| i.stream == f.str("stream") && i.gen == f.u64("gen"))
-                    .and_then(|i| i.verified);
-                drop(s);
-                if let (Some(cb), Some(r)) = (&inner.opts.on_stream_checked, result) {
-                    cb(participant, f.str("stream"), f.u64("gen"), &r);
+                    .flatten()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect();
+                let state = inner.custody_state(participant, &to);
+                let m: Meta = ["id", "from", "to", "t", "kind"]
+                    .iter()
+                    .map(|k| (k.to_string(), f.meta[*k].clone()))
+                    .collect();
+                let new = inner
+                    .messages
+                    .put(m.clone(), &body, state.clone())
+                    .map_err(storage)?;
+                c.send(&Frame::new(kind::MESSAGE_ACK, meta! {"id" => f.str("id")}))?; // only after storing
+                if new {
+                    let unknown = state["unknown"].as_array().map_or(0, Vec::len);
+                    if unknown > 0 {
+                        log(
+                            "hub",
+                            &format!(
+                                "message {} from {}: {} not on the participant list, not delivered",
+                                f.str("id"),
+                                participant,
+                                state["unknown"]
+                            ),
+                        );
+                    }
+                    inner.to_hub(&m);
+                }
+                Ok(())
+            }
+            kind::MESSAGE_ACK => {
+                let id = f.str("id").to_string();
+                if self.mail_inflight.remove(&id) {
+                    let p = participant.to_string();
+                    inner
+                        .messages
+                        .modify(&id, |st| move_to_delivered(st, &p))
+                        .map_err(storage)?;
+                }
+                Ok(())
+            }
+            kind::DELIVERY_ACK => {
+                let id = f.str("id").to_string();
+                self.report_inflight.remove(&id);
+                let n = f.u64("delivered");
+                let from_this = inner
+                    .messages
+                    .select(|r| r.meta["id"].as_str() == Some(id.as_str()))
+                    .first()
+                    .is_some_and(|r| r.meta["from"].as_str() == Some(participant));
+                if from_this {
+                    inner
+                        .messages
+                        .modify(&id, |st| {
+                            let old = st.get("reported").and_then(Value::as_i64).unwrap_or(-1);
+                            st.insert("reported".into(), json!(old.max(n as i64)));
+                            true
+                        })
+                        .map_err(storage)?;
+                }
+                Ok(())
+            }
+            kind::HEARTBEAT => Ok(()),
+            kind::BYE => Err(End::Lost(format!(
+                "{} closed the session: {}",
+                participant,
+                f.str("reason")
+            ))),
+            kind::ERROR => Err(End::Lost(format!(
+                "{} reported {}: {}",
+                participant,
+                f.str("code"),
+                f.str("text")
+            ))),
+            _ if f.is_extension() => Ok(()),
+            t => Err(End::Bad(FrameError::new(
+                "bad_frame",
+                format!("unexpected {} from {}", frames::type_name(t), participant),
+            ))),
+        }
+    }
+
+    /// Messages pending for this participant and delivery reports owed to it (spec 8.5), at most `WINDOW` each in
+    /// flight. True if anything was sent.
+    fn send_mail(&mut self, c: &mut Conn, inner: &Inner) -> Result<bool, End> {
+        let p = self.participant.clone();
+        let mut progressed = false;
+        let pending = inner.messages.select(|r| {
+            r.state["pending"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|x| x.as_str() == Some(p.as_str())))
+        });
+        for rec in pending {
+            if self.mail_inflight.len() >= WINDOW {
+                break;
+            }
+            let id = rec.meta["id"].as_str().unwrap_or("").to_string();
+            if self.mail_inflight.contains(&id) {
+                continue;
+            }
+            c.send(
+                &inner
+                    .messages
+                    .message_frame(&rec, inner.opts.zlib_level)
+                    .map_err(storage)?,
+            )?;
+            self.mail_inflight.insert(id);
+            progressed = true;
+        }
+        let reports = inner
+            .messages
+            .select(|r| r.meta["from"].as_str() == Some(p.as_str()) && needs_report(&r.state));
+        for rec in reports {
+            if self.report_inflight.len() >= WINDOW {
+                break;
+            }
+            let id = rec.meta["id"].as_str().unwrap_or("").to_string();
+            if self.report_inflight.contains(&id) {
+                continue;
+            }
+            let st = &rec.state;
+            c.send(&Frame::new(
+                kind::DELIVERY,
+                meta! {"id" => id, "delivered" => st["delivered"], "pending" => st["pending"], "unknown" => st["unknown"]},
+            ))?;
+            self.report_inflight.insert(id);
+            progressed = true;
+        }
+        Ok(progressed)
+    }
+}
+
+/// A recipient took custody: move it from `pending` to `delivered`.
+fn move_to_delivered(st: &mut Map<String, Value>, participant: &str) -> bool {
+    let pending: Vec<Value> = st["pending"].as_array().cloned().unwrap_or_default();
+    if !pending.iter().any(|x| x.as_str() == Some(participant)) {
+        return false;
+    }
+    st.insert(
+        "pending".into(),
+        Value::Array(
+            pending
+                .into_iter()
+                .filter(|x| x.as_str() != Some(participant))
+                .collect(),
+        ),
+    );
+    if let Some(d) = st.get_mut("delivered").and_then(Value::as_array_mut) {
+        d.push(json!(participant));
+    }
+    true
+}
+
+/// True if the hub owes the sender a delivery report: more recipients delivered than reported, and something to
+/// say – somebody delivered, somebody unknown, or nobody left to wait for (spec 8.5).
+fn needs_report(st: &Map<String, Value>) -> bool {
+    let len = |k: &str| st.get(k).and_then(Value::as_array).map_or(0, Vec::len);
+    let n = len("delivered") as i64;
+    n > st.get("reported").and_then(Value::as_i64).unwrap_or(-1)
+        && (n > 0 || len("unknown") > 0 || len("pending") == 0)
+}
+
+/// A disk error at the hub: nothing is acknowledged (spec 14.10); ERROR `storage`, connection closed.
+fn storage(e: io::Error) -> End {
+    End::Bad(FrameError::new(
+        "storage",
+        format!("the hub cannot store data: {}", e),
+    ))
+}
+
+/// The streams of every source, relayed to one consumer as `<source>/<stream>` (spec 7): from what the consumer
+/// reported in its greeting, `STREAM_END` only for streams verified at the hub, block repair from the hub's copy.
+struct Relay {
+    sender: Sender,
+    outs: BTreeMap<(String, u64), OutStream>,
+    have: HashMap<(String, u64), u64>,
+}
+
+impl Relay {
+    fn new(hello: &Frame, opts: &HubOptions) -> Relay {
+        let have = hello.meta["have"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|h| {
+                (
+                    (
+                        h["stream"].as_str().unwrap_or("").to_string(),
+                        h["gen"].as_u64().unwrap_or(0),
+                    ),
+                    h["committed"].as_u64().unwrap_or(0),
+                )
+            })
+            .collect();
+        Relay {
+            sender: Sender::new(opts.segment_bytes, opts.window, opts.zlib_level, "hub"),
+            outs: BTreeMap::new(),
+            have,
+        }
+    }
+
+    fn refresh(&mut self, inner: &Inner) {
+        let stores: Vec<(String, Arc<Mutex<Store>>)> = inner
+            .stores
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(p, s)| (p.clone(), s.clone()))
+            .collect();
+        for (p, store) in stores {
+            if inner.participants.get(&p).map(String::as_str) != Some("source") {
+                continue;
+            }
+            for info in store.lock().unwrap().streams() {
+                let key = (format!("{}/{}", p, info.stream), info.gen);
+                let have = self.have.get(&key).copied().unwrap_or(0);
+                let o = self.outs.entry(key).or_insert_with(|| {
+                    let mut o = OutStream::new(info.gen, info.path.clone());
+                    o.start_session(have);
+                    o
+                });
+                o.size = info.committed;
+                if info.complete && info.verified.as_deref() == Some("ok") {
+                    o.final_size = Some(info.committed); // verified at the hub: the consumer may check it too
                 }
             }
-            Ok(())
         }
-        // messages follow in the next step: not acknowledged, so the sender keeps them
-        kind::MESSAGE | kind::MESSAGE_ACK | kind::DELIVERY_ACK => Ok(()),
-        kind::HEARTBEAT => Ok(()),
-        kind::BYE => Err(End::Lost(format!(
-            "{} closed the session: {}",
-            participant,
-            f.str("reason")
-        ))),
-        kind::ERROR => Err(End::Lost(format!(
-            "{} reported {}: {}",
-            participant,
-            f.str("code"),
-            f.str("text")
-        ))),
-        _ if f.is_extension() => Ok(()),
-        t => Err(End::Bad(FrameError::new(
-            "bad_frame",
-            format!("unexpected {} from {}", frames::type_name(t), participant),
-        ))),
+    }
+
+    fn handle(&mut self, f: &Frame) {
+        if let Some(o) = self
+            .outs
+            .get_mut(&(f.str("stream").to_string(), f.u64("gen")))
+        {
+            self.sender.handle(f, f.str("stream"), o);
+        }
+    }
+
+    fn work(&mut self, c: &mut Conn, inner: &Inner) -> Result<bool, End> {
+        self.refresh(inner);
+        let mut progressed = false;
+        for ((name, _gen), o) in self.outs.iter_mut() {
+            if o.sums_complete() {
+                // the hub repairs a consumer only from its own verified copy, never with a new generation
+                self.sender.compare(name, o, false)?;
+            }
+            progressed |= self.sender.send(c, name, o)?;
+        }
+        Ok(progressed)
     }
 }
 

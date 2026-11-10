@@ -39,6 +39,9 @@ hub_from_source
 hub_from_source_disconnects
 hub_restart
 hub_repair
+hub_relay
+hub_messages
+hub_message_to_hub
 hub_reject_unknown
 hub_reject_wrong_operation
 hub_reject_role
