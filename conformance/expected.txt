@@ -11,9 +11,11 @@ reject_unknown
 reject_wrong_operation
 reject_role
 
-# consumer over TCP (consumer_disconnects, consumer_restart, consumer_repair pass as well; they go in here once
-# rope#55 adds them to the suite)
+# consumer over TCP
 consumer_relay
+consumer_disconnects
+consumer_restart
+consumer_repair
 
 # messages with custody (source and recipient)
 message_to_adapter
@@ -31,3 +33,15 @@ frame_bad_ack_without_committed
 frame_unknown_core_type
 frame_extension_ignored
 frame_reject_announced
+
+# offline media (participant roles; the hub_media_* scenarios need a hub)
+media_source
+media_consumer
+media_message_to_adapter
+media_message_from_adapter
+media_foreign_bundle
+media_source_in_parts
+media_damaged_bundle
+media_cut_off_bundle
+media_repair
+media_consumer_repair

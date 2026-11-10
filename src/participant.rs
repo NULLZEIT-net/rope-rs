@@ -3,6 +3,9 @@
 
 use crate::frames::{self, kind, Frame, FrameError};
 use crate::mailbox::{MailSession, Mailbox, Message, OnDelivery, OnMessage, Sent};
+use crate::media::{
+    check_manifest, find_bundles, read_frames, BundleWriter, ExportReport, ImportReport, Skipped,
+};
 use crate::session::{Conn, End};
 use crate::{meta, now_ms, PROTOCOL_VERSION};
 use serde_json::Value;
@@ -103,6 +106,11 @@ pub(crate) fn debug(what: &str, text: impl FnOnce() -> String) {
 
 /// A running participant: reconnects forever with back-off until [`Participant::stop`].
 pub struct Participant {
+    id: String,
+    operation: String,
+    /// The hub's identifier, from the last WELCOME ("hub" until then); bundles for the hub are addressed to it.
+    hub_id: Arc<Mutex<String>>,
+    zlib_level: u32,
     mailbox: Arc<Mailbox>,
     rejected: Arc<Mutex<Option<Rejected>>>,
     connected: Arc<AtomicBool>,
@@ -119,6 +127,7 @@ struct Config {
 
 struct Running {
     cfg: Config,
+    hub_id: Arc<Mutex<String>>,
     mailbox: Arc<Mailbox>,
     rejected: Arc<Mutex<Option<Rejected>>>,
     connected: Arc<AtomicBool>,
@@ -140,7 +149,10 @@ impl Participant {
             opts.on_message.clone(),
             opts.on_delivery.clone(),
         )?);
+        let zlib_level = opts.zlib_level;
+        let hub_id = Arc::new(Mutex::new("hub".to_string()));
         let run = Running {
+            hub_id: hub_id.clone(),
             cfg: Config {
                 participant: participant.into(),
                 operation: operation.into(),
@@ -159,6 +171,10 @@ impl Participant {
         );
         let thread = thread::spawn(move || run.run(role));
         Ok(Participant {
+            id: participant.into(),
+            operation: operation.into(),
+            hub_id,
+            zlib_level,
             mailbox,
             rejected,
             connected,
@@ -194,6 +210,91 @@ impl Participant {
     /// The hub's last refusal; cleared by the next session it accepts.
     pub fn rejected(&self) -> Option<Rejected> {
         self.rejected.lock().unwrap().clone()
+    }
+
+    // --- offline media (spec 8.6) ------------------------------------------------------------------------------
+
+    /// Writes a bundle for the hub to the folder `medium` (e.g. a USB stick): receipts, then the messages the hub
+    /// does not hold yet. `max_bytes` limits the bundle; the report says whether everything fitted.
+    pub fn export_media(&self, medium: &Path, max_bytes: Option<u64>) -> io::Result<ExportReport> {
+        self.export_bundle(medium, max_bytes, &mut |_| Ok(true), &mut |_| Ok(true))
+    }
+
+    /// Imports every bundle on `medium` the hub wrote for this participant, oldest first. Importing a bundle again
+    /// changes nothing. One report per bundle; `problems` lists what was skipped and why.
+    pub fn import_media(&self, medium: &Path) -> io::Result<Vec<ImportReport>> {
+        self.import_bundles(medium, &mut |_, _, _| Ok(false))
+    }
+
+    /// Export with the role's parts: `receipts` (after the message receipts) and `data` (after the messages).
+    pub(crate) fn export_bundle(
+        &self,
+        medium: &Path,
+        max_bytes: Option<u64>,
+        receipts: &mut dyn FnMut(&mut BundleWriter) -> io::Result<bool>,
+        data: &mut dyn FnMut(&mut BundleWriter) -> io::Result<bool>,
+    ) -> io::Result<ExportReport> {
+        let hub = self.hub_id.lock().unwrap().clone();
+        let mut w = BundleWriter::new(medium, &self.operation, &self.id, &hub, max_bytes)?;
+        // order inside a bundle: receipts, then messages, then streams (spec 8.6)
+        let mut ok = true;
+        for f in self.mailbox.media_receipts() {
+            if !w.add(&f)? {
+                ok = false;
+                break;
+            }
+        }
+        ok = ok && receipts(&mut w)?;
+        ok = ok && self.mailbox.media_messages(&mut w, self.zlib_level)?;
+        if ok {
+            data(&mut w)?;
+        }
+        w.close()
+    }
+
+    /// Import with the role's part: `frame` takes the frames the mailbox does not take (false: not for this role).
+    pub(crate) fn import_bundles(
+        &self,
+        medium: &Path,
+        frame: &mut dyn FnMut(&Frame, &mut ImportReport, &mut Skipped) -> io::Result<bool>,
+    ) -> io::Result<Vec<ImportReport>> {
+        let mut reports = Vec::new();
+        for (path, manifest) in find_bundles(medium, &self.operation, &self.id)? {
+            let mut rep = ImportReport {
+                path: path.clone(),
+                sender: manifest
+                    .as_ref()
+                    .and_then(|m| m.get("from"))
+                    .and_then(Value::as_str)
+                    .map(String::from),
+                ..Default::default()
+            };
+            if let Some(reason) = check_manifest(manifest.as_ref(), &self.operation, &self.id) {
+                rep.problems.push(reason);
+                reports.push(rep);
+                continue;
+            }
+            let mut skipped = Skipped::new();
+            let mailbox = &self.mailbox;
+            read_frames(
+                &path,
+                manifest.as_ref().unwrap(),
+                &mut rep,
+                &mut |f, rep| {
+                    if mailbox.media_import(&f, rep)? || frame(&f, rep, &mut skipped)? {
+                        return Ok(());
+                    }
+                    rep.problems.push(format!(
+                        "unexpected {} in a bundle from the hub - skipped",
+                        frames::type_name(f.ftype)
+                    ));
+                    Ok(())
+                },
+            )?;
+            reports.push(rep);
+        }
+        self.mailbox.notify()?; // tell the application about what came on the medium
+        Ok(reports)
     }
 
     /// Ends the session (with `BYE`) and the reconnect loop; returns when the thread has finished.
@@ -306,6 +407,7 @@ impl Running {
             return Err(FrameError::new("bad_frame", text).into());
         }
         let w = &first.meta;
+        *self.hub_id.lock().unwrap() = first.str("hub").to_string();
         c.version = w["version"].as_u64().unwrap_or(1).min(255) as u8;
         let heartbeat = Duration::from_secs_f64(w["heartbeat_s"].as_f64().unwrap_or(2.0));
         let timeout = Duration::from_secs_f64(w["timeout_s"].as_f64().unwrap_or(10.0));

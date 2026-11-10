@@ -171,6 +171,31 @@ impl Adapter {
                 out.insert("id".into(), json!(id));
                 return Ok(out);
             }
+            "export_media" => {
+                let medium = PathBuf::from(text(c, "medium")?);
+                let max = c["max_bytes"].as_u64();
+                let rep = match self.running.as_ref().ok_or("nothing running")? {
+                    Running::Source(s) => s.export_media(&medium, max),
+                    Running::Consumer(k) => k.export_media(&medium, max),
+                    Running::Other(p) => p.export_media(&medium, max),
+                }
+                .map_err(|e| e.to_string())?;
+                let out = json!({"complete": rep.complete, "stream_bytes": rep.stream_bytes, "messages": rep.messages,
+                                 "repair_bytes": rep.repair_bytes, "path": rep.path});
+                return Ok(out.as_object().unwrap().clone());
+            }
+            "import_media" => {
+                let medium = PathBuf::from(text(c, "medium")?);
+                let reps = match self.running.as_ref().ok_or("nothing running")? {
+                    Running::Source(s) => s.import_media(&medium),
+                    Running::Consumer(k) => k.import_media(&medium),
+                    Running::Other(p) => p.import_media(&medium),
+                }
+                .map_err(|e| e.to_string())?;
+                let problems: Vec<&String> = reps.iter().flat_map(|r| r.problems.iter()).collect();
+                let out = json!({"bundles": reps.len(), "problems": problems});
+                return Ok(out.as_object().unwrap().clone());
+            }
             "status" => return Ok(self.status()),
             "stop" => self.stop(),
             other => return Err(format!("not implemented in rope-rs yet: {}", other)),

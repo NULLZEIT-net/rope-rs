@@ -23,8 +23,14 @@ The wire protocol has its own number (`PROTOCOL_VERSION`, spec 14.5).
   `RESEND`, reports what it holds in `HELLO.have`, final check with SHA-256, `BLOCK_SUMS` on a mismatch and repair
   segments below the committed offset; after a crash, bytes written but never committed are cut off. A stream name
   is never used as a path.
-- Conformance adapter (`rope-conformance-adapter`) and `conformance/run.py`: 22 scenarios of the ROPE conformance
-  suite are required (source and consumer over TCP, messages both ways also through a breaking link, rejects, frame
-  level).
+- Offline media, media format 1 (spec 8.6, `media`): bundles written below `.partial` and renamed when durable,
+  frames files of at most 1 GiB, `max_bytes` stops at a frame boundary; import reads one frame at a time, skips a
+  frame with a wrong CRC, stops a file at a damaged header, reports cut-off files and gaps, never changes a verified
+  stream. `export_media` / `import_media` for source (from the hub's `ACK`, block repairs asked for in a bundle,
+  a new generation if most blocks differ), consumer (`ACK`, repair requests) and recipient (messages, receipts,
+  delivery reports).
+- Conformance adapter (`rope-conformance-adapter`) and `conformance/run.py`: 35 of the 60 scenarios of the ROPE
+  conformance suite are required – every participant scenario (source and consumer over TCP and by offline media,
+  messages both ways, rejects, frame level).
 - Dependencies: `serde_json`, `crc32fast`, `sha2`, `flate2` (pure-Rust backend) – JSON, CRC-32, SHA-256 and zlib are
   not in the Rust standard library.

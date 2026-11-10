@@ -9,6 +9,7 @@
 //! holder's state, written atomically – its presence means "held").
 
 use crate::frames::{self, kind, Frame, Meta};
+use crate::media::{BundleWriter, ImportReport};
 use crate::session::{Conn, End};
 use crate::{meta, now_ms};
 use serde_json::{json, Map, Value};
@@ -350,6 +351,95 @@ impl Mailbox {
             true
         })
     }
+
+    /// The MESSAGE frame of a stored message.
+    fn message_frame(&self, rec: &Record, zlib_level: u32) -> io::Result<Frame> {
+        let body = self.body(rec.meta["id"].as_str().unwrap_or(""))?;
+        let (enc, blob) = frames::encode_payload(&body, zlib_level);
+        let mut m = rec.meta.clone();
+        m.insert("len".into(), json!(body.len()));
+        m.insert("crc".into(), json!(frames::crc32(&body)));
+        m.insert("enc".into(), json!(enc));
+        Ok(Frame::with_blob(kind::MESSAGE, m, blob))
+    }
+
+    // --- offline media (spec 8.6) ------------------------------------------------------------------------------
+
+    /// Receipts for a bundle to the hub: `MESSAGE_ACK` for messages that came on a medium, `DELIVERY_ACK` for every
+    /// report held (the hub ignores what it already knows).
+    pub(crate) fn media_receipts(&self) -> Vec<Frame> {
+        let mut out: Vec<Frame> = self
+            .select(|r| r.is("in") && r.state.get("via").and_then(Value::as_str) == Some("media"))
+            .iter()
+            .map(|r| Frame::new(kind::MESSAGE_ACK, meta! {"id" => r.meta["id"]}))
+            .collect();
+        for r in self.select(|r| r.is("out") && r.state.get("report").is_some()) {
+            let n = r.state["report"]["delivered"]
+                .as_array()
+                .map_or(0, Vec::len);
+            out.push(Frame::new(
+                kind::DELIVERY_ACK,
+                meta! {"id" => r.meta["id"], "delivered" => n},
+            ));
+        }
+        out
+    }
+
+    /// Adds the outbox messages the hub does not hold yet. False when the medium is full.
+    pub(crate) fn media_messages(&self, w: &mut BundleWriter, zlib_level: u32) -> io::Result<bool> {
+        for rec in self.select(|r| r.is("out") && r.flag("at_hub") != Some(true)) {
+            if !w.add(&self.message_frame(&rec, zlib_level)?)? {
+                return Ok(false);
+            }
+            w.report.messages += 1;
+        }
+        Ok(true)
+    }
+
+    /// MESSAGE, MESSAGE_ACK or DELIVERY from a bundle of the hub. False for other frames.
+    pub(crate) fn media_import(&self, f: &Frame, rep: &mut ImportReport) -> io::Result<bool> {
+        match f.ftype {
+            kind::MESSAGE => match frames::payload(f) {
+                Ok(body) => {
+                    let m: Meta = ["id", "from", "to", "t", "kind"]
+                        .iter()
+                        .map(|k| (k.to_string(), f.meta[*k].clone()))
+                        .collect();
+                    let mut state = Map::new();
+                    state.insert("box".into(), json!("in"));
+                    state.insert("told".into(), json!(false));
+                    state.insert("via".into(), json!("media"));
+                    if self.put(m, &body, state)? {
+                        rep.messages.push(f.str("id").to_string());
+                    }
+                }
+                Err(e) => {
+                    rep.problems
+                        .push(format!("message {}: {} - skipped", f.str("id"), e.text))
+                }
+            },
+            kind::MESSAGE_ACK => {
+                let id = f.str("id").to_string();
+                let is_out = self
+                    .items
+                    .lock()
+                    .unwrap()
+                    .get(&id)
+                    .is_some_and(|r| r.is("out"));
+                if is_out {
+                    self.modify(&id, |st| {
+                        st.insert("at_hub".into(), json!(true));
+                        true
+                    })?;
+                }
+            }
+            kind::DELIVERY => {
+                self.take_report(f)?;
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
 }
 
 /// The message side of one session: sends the outbox, receives messages and reports.
@@ -384,13 +474,7 @@ impl<'a> MailSession<'a> {
             if self.inflight.contains(&id) {
                 continue;
             }
-            let body = self.mailbox.body(&id)?;
-            let (enc, blob) = frames::encode_payload(&body, self.zlib_level);
-            let mut m = rec.meta.clone();
-            m.insert("len".into(), json!(body.len()));
-            m.insert("crc".into(), json!(frames::crc32(&body)));
-            m.insert("enc".into(), json!(enc));
-            c.send(&Frame::with_blob(kind::MESSAGE, m, blob))?;
+            c.send(&self.mailbox.message_frame(&rec, self.zlib_level)?)?;
             self.inflight.insert(id);
             progressed = true;
         }
