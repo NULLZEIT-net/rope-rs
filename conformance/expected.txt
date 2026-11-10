@@ -65,3 +65,12 @@ media_damaged_bundle
 media_cut_off_bundle
 media_repair
 media_consumer_repair
+
+# offline media, the hub under test
+hub_media_from_source
+hub_media_to_consumer
+hub_media_messages
+hub_media_damaged_bundle
+hub_media_cut_off_bundle
+hub_media_repair
+hub_media_consumer_repair

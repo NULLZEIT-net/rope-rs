@@ -193,6 +193,30 @@ impl Adapter {
         if let (Some((hub, checked)), "status") = (&self.hub, cmd) {
             return Ok(self.hub_status(hub, checked));
         }
+        if let Some((hub, _)) = &self.hub {
+            if cmd == "export_media" {
+                let rep = hub
+                    .export_media(
+                        &PathBuf::from(text(c, "medium")?),
+                        text(c, "participant")?,
+                        c["max_bytes"].as_u64(),
+                    )
+                    .map_err(|e| e.to_string())?;
+                let out = json!({"complete": rep.complete, "stream_bytes": rep.stream_bytes, "messages": rep.messages,
+                                 "repair_bytes": rep.repair_bytes, "path": rep.path});
+                return Ok(out.as_object().unwrap().clone());
+            }
+            if cmd == "import_media" {
+                let reps = hub
+                    .import_media(&PathBuf::from(text(c, "medium")?))
+                    .map_err(|e| e.to_string())?;
+                let problems: Vec<&String> = reps.iter().flat_map(|r| r.problems.iter()).collect();
+                return Ok(json!({"bundles": reps.len(), "problems": problems})
+                    .as_object()
+                    .unwrap()
+                    .clone());
+            }
+        }
         match cmd {
             "start_source" => {
                 self.stop();

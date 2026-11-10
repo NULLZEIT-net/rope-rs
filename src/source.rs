@@ -7,13 +7,11 @@
 //! Not yet: offline media.
 
 use crate::frames::{self, kind, Frame};
-use crate::media::{collect_repair_frame, BundleWriter, ExportReport, ImportReport};
+use crate::media::{collect_repair_frame, ExportReport, ImportReport};
+use crate::now_ms;
 use crate::participant::{log, Participant, Role};
-use crate::sender::{
-    differing_blocks, is_sender_frame, read_range, sha256_prefix, OutStream, Sender,
-};
+use crate::sender::{differing_blocks, is_sender_frame, read_range, OutStream, Sender};
 use crate::session::{Conn, End};
-use crate::{meta, now_ms};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
@@ -160,57 +158,7 @@ pub struct Source {
     zlib_level: u32,
 }
 
-/// Raw bytes per segment on a medium (spec 8.6).
-const MEDIA_SEGMENT: u64 = crate::media::SEGMENT_BYTES;
-
-/// Adds the bytes `start`..`limit` of a file as SEGMENT frames, and STREAM_END if `final_size` is set and the stream
-/// is complete up to it. False when the medium is full.
-#[allow(clippy::too_many_arguments)]
-fn add_stream(
-    w: &mut BundleWriter,
-    name: &str,
-    gen: u64,
-    path: &Path,
-    start: u64,
-    limit: u64,
-    final_size: Option<u64>,
-    level: u32,
-) -> io::Result<bool> {
-    let mut off = start;
-    while off < limit {
-        let data = read_range(path, off, MEDIA_SEGMENT.min(limit - off))?;
-        if data.is_empty() {
-            break;
-        }
-        if !w.add(&frames::segment(
-            name,
-            gen,
-            off,
-            &data,
-            now_ms(),
-            level,
-            false,
-        ))? {
-            return Ok(false);
-        }
-        w.report.segments += 1;
-        w.report.stream_bytes += data.len() as u64;
-        off += data.len() as u64;
-    }
-    if let Some(fin) = final_size {
-        if off >= fin {
-            let (digest, n) = sha256_prefix(path, fin)?;
-            let end = Frame::new(
-                kind::STREAM_END,
-                meta! {"stream" => name, "gen" => gen, "size" => n, "sha256" => digest},
-            );
-            if n == fin && !w.add(&end)? {
-                return Ok(false);
-            }
-        }
-    }
-    Ok(true)
-}
+use crate::media::{add_stream, SEGMENT_BYTES as MEDIA_SEGMENT};
 
 impl Deref for Source {
     type Target = Participant;

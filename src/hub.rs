@@ -3,10 +3,14 @@
 //! of messages (spec 8.5): delivers them to every recipient on its list, reports delivery to the sender, and hands
 //! messages addressed to the hub itself to its application.
 //!
-//! Not yet: offline media.
+//! Offline media (spec 8.6): [`Hub::import_media`] and [`Hub::export_media`] carry the same frames by stick.
 
 use crate::frames::{self, kind, Frame, FrameError, Meta};
 use crate::mailbox::{Mailbox, OnMessage, WINDOW};
+use crate::media::{
+    add_repair, add_stream, check_manifest, collect_repair_frame, find_bundles, read_frames,
+    BundleWriter, ExportReport, ImportReport, Skipped,
+};
 use crate::participant::{debug, log};
 use crate::receiver::{Store, StreamInfo};
 use crate::sender::{is_sender_frame, OutStream, Sender};
@@ -93,6 +97,7 @@ struct Inner {
     messages: Mailbox,
     /// Messages to the hub told in this run (noted at once; the flag on disk follows).
     hub_told: Mutex<HashSet<String>>,
+    media: Mutex<MediaState>,
 }
 
 /// A running hub. Stops with [`Hub::stop`] (or when dropped); its state stays on disk, so a hub started again on the
@@ -165,6 +170,7 @@ impl Hub {
             stop: AtomicBool::new(false),
             messages: Mailbox::open(&root.join("messages"), "hub", None, None)?,
             hub_told: Mutex::new(HashSet::new()),
+            media: Mutex::new(MediaState::load(root)?),
         });
         inner.retell(); // messages to the hub not taken before a restart
                         // open what earlier runs stored, so that the hub reports it from the start
@@ -844,6 +850,431 @@ impl Relay {
             progressed |= self.sender.send(c, name, o)?;
         }
         Ok(progressed)
+    }
+}
+
+// --- offline media (spec 8.6) ----------------------------------------------------------------------------------------
+
+/// What consumers last reported in bundles, and the block repairs they asked for; kept durably below the hub's
+/// folder (`media_have.json`, `media_repairs.json`). State per consumer, for media only: on the network a consumer
+/// reports in `HELLO`.
+/// (relayed stream, gen) -> (size, block size, block sums): block repairs a consumer asked for.
+type Requests = BTreeMap<(String, u64), (u64, u64, Vec<String>)>;
+
+#[derive(Default)]
+struct MediaState {
+    /// consumer -> (relayed stream, gen) -> committed
+    have: BTreeMap<String, BTreeMap<(String, u64), u64>>,
+    /// consumer -> (relayed stream, gen) -> (size, block size, block sums)
+    repairs: BTreeMap<String, Requests>,
+}
+
+impl MediaState {
+    fn load(root: &Path) -> io::Result<MediaState> {
+        let read = |name: &str| -> io::Result<Value> {
+            match std::fs::read(root.join(name)) {
+                Ok(raw) => Ok(serde_json::from_slice(&raw)?),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Value::Null),
+                Err(e) => Err(e),
+            }
+        };
+        let mut st = MediaState::default();
+        for (consumer, list) in read("media_have.json")?.as_object().into_iter().flatten() {
+            let mine = st.have.entry(consumer.clone()).or_default();
+            for e in list.as_array().into_iter().flatten() {
+                if let (Some(s), Some(g), Some(c)) = (
+                    e["stream"].as_str(),
+                    e["gen"].as_u64(),
+                    e["committed"].as_u64(),
+                ) {
+                    mine.insert((s.to_string(), g), c);
+                }
+            }
+        }
+        for (consumer, list) in read("media_repairs.json")?
+            .as_object()
+            .into_iter()
+            .flatten()
+        {
+            let mine = st.repairs.entry(consumer.clone()).or_default();
+            for e in list.as_array().into_iter().flatten() {
+                let sums: Option<Vec<String>> = e["sums"].as_array().map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                });
+                if let (Some(s), Some(g), Some(size), Some(b), Some(sums)) = (
+                    e["stream"].as_str(),
+                    e["gen"].as_u64(),
+                    e["size"].as_u64(),
+                    e["block_size"].as_u64(),
+                    sums,
+                ) {
+                    mine.insert((s.to_string(), g), (size, b, sums));
+                }
+            }
+        }
+        Ok(st)
+    }
+
+    fn save(&self, root: &Path) -> io::Result<()> {
+        let have: Map<String, Value> = self
+            .have
+            .iter()
+            .map(|(c, m)| {
+                (
+                    c.clone(),
+                    Value::Array(
+                        m.iter()
+                            .map(|((s, g), n)| json!({"stream": s, "gen": g, "committed": n}))
+                            .collect(),
+                    ),
+                )
+            })
+            .collect();
+        let repairs: Map<String, Value> = self
+            .repairs
+            .iter()
+            .map(|(c, m)| {
+                let list = m.iter().map(|((s, g), (size, b, sums))| json!({"stream": s, "gen": g, "size": size, "block_size": b, "sums": sums}));
+                (c.clone(), Value::Array(list.collect()))
+            })
+            .collect();
+        write_json(&root.join("media_have.json"), &Value::Object(have))?;
+        write_json(&root.join("media_repairs.json"), &Value::Object(repairs))
+    }
+}
+
+fn write_json(path: &Path, v: &Value) -> io::Result<()> {
+    use std::io::Write;
+    let tmp = path.with_extension("json.tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&serde_json::to_vec(v)?)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)
+}
+
+impl Hub {
+    /// Imports every bundle on `medium` addressed to this hub, oldest first, as if it had arrived over the network:
+    /// streams from sources, messages from everyone, receipts, what consumers hold and the repairs they ask for.
+    /// Importing a bundle again changes nothing. Only bundles from participants on the list are taken, and only
+    /// messages written by the bundle's sender (spec 8.6). One report per bundle.
+    pub fn import_media(&self, medium: &Path) -> io::Result<Vec<ImportReport>> {
+        let inner = &self.inner;
+        let mut reports = Vec::new();
+        for (path, manifest) in find_bundles(medium, &inner.operation, &inner.opts.hub_id)? {
+            let sender = manifest
+                .as_ref()
+                .and_then(|m| m.get("from"))
+                .and_then(Value::as_str)
+                .map(String::from);
+            let mut rep = ImportReport {
+                path: path.clone(),
+                sender: sender.clone(),
+                ..Default::default()
+            };
+            let mut reason =
+                check_manifest(manifest.as_ref(), &inner.operation, &inner.opts.hub_id);
+            let role = sender
+                .as_ref()
+                .and_then(|s| inner.participants.get(s))
+                .cloned();
+            if reason.is_none() && role.is_none() {
+                reason = Some(format!(
+                    "the bundle is from {}, who is not on the participant list of this hub",
+                    sender.clone().unwrap_or_default()
+                ));
+            }
+            if let Some(r) = reason {
+                rep.problems.push(r);
+                reports.push(rep);
+                continue;
+            }
+            let (sender, role) = (sender.unwrap(), role.unwrap());
+            let store = if role == "source" {
+                Some(inner.store(&sender)?)
+            } else {
+                None
+            };
+            let mut skipped = Skipped::new();
+            let mut requests = BTreeMap::new();
+            read_frames(
+                &path,
+                manifest.as_ref().unwrap(),
+                &mut rep,
+                &mut |f, rep| {
+                    match f.ftype {
+                        kind::SEGMENT | kind::STREAM_END if store.is_some() => {
+                            let key = (f.str("stream").to_string(), f.u64("gen"));
+                            if format!("{}/{}", sender, key.0).len() > 255 {
+                                if skipped.insert(key.clone()) {
+                                    rep.problems.push(format!(
+                                        "stream name {:?} is too long to relay - skipped",
+                                        key.0
+                                    ));
+                                }
+                            } else {
+                                store.as_ref().unwrap().lock().unwrap().media_frame(
+                                    &f,
+                                    rep,
+                                    &mut skipped,
+                                )?;
+                            }
+                        }
+                        kind::MESSAGE => {
+                            if f.str("from") != sender {
+                                rep.problems.push(format!("message {} claims to be from {}, the bundle is from {} - skipped", f.str("id"), f.str("from"), sender));
+                                return Ok(());
+                            }
+                            let body = match frames::payload(&f) {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    rep.problems.push(format!(
+                                        "message {}: {} - skipped",
+                                        f.str("id"),
+                                        e.text
+                                    ));
+                                    return Ok(());
+                                }
+                            };
+                            let to: Vec<String> = f.meta["to"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect();
+                            let m: Meta = ["id", "from", "to", "t", "kind"]
+                                .iter()
+                                .map(|k| (k.to_string(), f.meta[*k].clone()))
+                                .collect();
+                            if inner.messages.put(
+                                m.clone(),
+                                &body,
+                                inner.custody_state(&sender, &to),
+                            )? {
+                                rep.messages.push(f.str("id").to_string());
+                                inner.to_hub(&m);
+                            }
+                        }
+                        kind::MESSAGE_ACK => {
+                            let s = sender.clone();
+                            inner
+                                .messages
+                                .modify(f.str("id"), |st| move_to_delivered(st, &s))?;
+                        }
+                        kind::DELIVERY_ACK => {
+                            let id = f.str("id").to_string();
+                            let n = f.u64("delivered") as i64;
+                            let from_sender = inner
+                                .messages
+                                .select(|r| r.meta["id"].as_str() == Some(id.as_str()))
+                                .first()
+                                .is_some_and(|r| r.meta["from"].as_str() == Some(sender.as_str()));
+                            if from_sender {
+                                inner.messages.modify(&id, |st| {
+                                    let old =
+                                        st.get("reported").and_then(Value::as_i64).unwrap_or(-1);
+                                    st.insert("reported".into(), json!(old.max(n)));
+                                    true
+                                })?;
+                            }
+                        }
+                        kind::ACK if role == "consumer" => rep.acks.push((
+                            f.str("stream").to_string(),
+                            f.u64("gen"),
+                            f.u64("committed"),
+                        )),
+                        _ if role == "consumer" && collect_repair_frame(&f, &mut requests) => {}
+                        t => rep.problems.push(format!(
+                            "unexpected {} from a {} - skipped",
+                            frames::type_name(t),
+                            role
+                        )),
+                    }
+                    Ok(())
+                },
+            )?;
+            if let Some(cb) = &inner.opts.on_stream_checked {
+                for (stream, gen, result) in &rep.checked {
+                    cb(&sender, stream, *gen, result);
+                }
+            }
+            let complete: Vec<_> = requests
+                .into_iter()
+                .filter_map(|(k, r)| r.complete_sums().map(|s| (k, (r.size, r.block_size, s))))
+                .collect();
+            if !rep.acks.is_empty() || !complete.is_empty() {
+                let mut media = inner.media.lock().unwrap();
+                let mine = media.have.entry(sender.clone()).or_default();
+                for (s, g, c) in &rep.acks {
+                    let e = mine.entry((s.clone(), *g)).or_insert(0);
+                    *e = (*e).max(*c);
+                }
+                media
+                    .repairs
+                    .entry(sender.clone())
+                    .or_default()
+                    .extend(complete);
+                media.save(&inner.root)?;
+            }
+            reports.push(rep);
+        }
+        Ok(reports)
+    }
+
+    /// Writes a bundle for `participant` to the folder `medium`: receipts and delivery reports for the messages it
+    /// sent, messages pending for it, and what its role needs – a source: what the hub holds of its streams (`ACK`)
+    /// and repair requests for streams whose final check failed here; a consumer: repairs it asked for (from the
+    /// hub's verified copy) and the relayed streams from what it last reported in a bundle, `STREAM_END` only for
+    /// streams verified here. `max_bytes` limits the bundle.
+    pub fn export_media(
+        &self,
+        medium: &Path,
+        participant: &str,
+        max_bytes: Option<u64>,
+    ) -> io::Result<ExportReport> {
+        let inner = &self.inner;
+        let Some(role) = inner.participants.get(participant).cloned() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} is not on the participant list of this hub", participant),
+            ));
+        };
+        let level = inner.opts.zlib_level;
+        let mut w = BundleWriter::new(
+            medium,
+            &inner.operation,
+            &inner.opts.hub_id,
+            participant,
+            max_bytes,
+        )?;
+        let mut ok = true;
+        // receipts first: messages the participant sent, and the delivery reports it is owed
+        for rec in inner
+            .messages
+            .select(|r| r.meta["from"].as_str() == Some(participant))
+        {
+            ok = ok
+                && w.add(&Frame::new(
+                    kind::MESSAGE_ACK,
+                    meta! {"id" => rec.meta["id"]},
+                ))?;
+        }
+        for rec in inner
+            .messages
+            .select(|r| r.meta["from"].as_str() == Some(participant) && needs_report(&r.state))
+        {
+            let st = &rec.state;
+            let report = meta! {"id" => rec.meta["id"], "delivered" => st["delivered"], "pending" => st["pending"], "unknown" => st["unknown"]};
+            ok = ok && w.add(&Frame::new(kind::DELIVERY, report))?;
+        }
+        if role == "source" && ok {
+            ok = inner
+                .store(participant)?
+                .lock()
+                .unwrap()
+                .media_receipts(&mut w)?;
+        }
+        let pending = inner.messages.select(|r| {
+            r.state["pending"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|x| x.as_str() == Some(participant)))
+        });
+        for rec in pending {
+            if !ok {
+                break;
+            }
+            ok = w.add(&inner.messages.message_frame(&rec, level)?)?;
+            if ok {
+                w.report.messages += 1;
+            }
+        }
+        let mut repaired = Vec::new();
+        if role == "consumer" {
+            let streams = self.streams();
+            let find = |name: &str, gen: u64| {
+                streams.iter().find(|s| {
+                    format!("{}/{}", s.participant, s.info.stream) == name && s.info.gen == gen
+                })
+            };
+            let asked = inner
+                .media
+                .lock()
+                .unwrap()
+                .repairs
+                .get(participant)
+                .cloned()
+                .unwrap_or_default();
+            for ((name, gen), (size, block, sums)) in asked {
+                let Some(s) = find(&name, gen).filter(|s| s.info.verified.as_deref() == Some("ok"))
+                else {
+                    continue;
+                };
+                if !ok {
+                    break;
+                }
+                let (fitted, _n) = add_repair(
+                    &mut w,
+                    &name,
+                    gen,
+                    &s.info.path,
+                    (size, block, &sums),
+                    level,
+                )?;
+                ok = fitted;
+                if ok {
+                    repaired.push((name, gen));
+                }
+            }
+            let have = inner
+                .media
+                .lock()
+                .unwrap()
+                .have
+                .get(participant)
+                .cloned()
+                .unwrap_or_default();
+            for s in &streams {
+                if !ok {
+                    break;
+                }
+                if inner.participants.get(&s.participant).map(String::as_str) != Some("source") {
+                    continue;
+                }
+                let name = format!("{}/{}", s.participant, s.info.stream);
+                let start = have
+                    .get(&(name.clone(), s.info.gen))
+                    .copied()
+                    .unwrap_or(0)
+                    .min(s.info.committed);
+                let fin = (s.info.complete && s.info.verified.as_deref() == Some("ok"))
+                    .then_some(s.info.committed);
+                ok = add_stream(
+                    &mut w,
+                    &name,
+                    s.info.gen,
+                    &s.info.path,
+                    start,
+                    s.info.committed,
+                    fin,
+                    level,
+                )?;
+            }
+        }
+        let report = w.close()?;
+        if !repaired.is_empty() {
+            // carried by a bundle: forget them; the consumer asks again if the stick never arrives
+            let mut media = inner.media.lock().unwrap();
+            if let Some(mine) = media.repairs.get_mut(participant) {
+                for k in &repaired {
+                    mine.remove(k);
+                }
+            }
+            media.save(&inner.root)?;
+        }
+        Ok(report)
     }
 }
 
