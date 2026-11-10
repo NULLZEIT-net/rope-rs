@@ -9,8 +9,10 @@ test of a protocol specification; this repository is the second one.
 
 ## Status
 
-Every role of the protocol is implemented and passes the whole conformance suite. **Not yet released**; not yet
-used outside tests (field experience comes from the Python reference first).
+**Version 0.1.0** (10.11.2026): every role of the protocol is implemented and passes the whole conformance suite.
+Its purpose for now is to **validate the specification with a second, independent implementation**; it is not yet
+used outside tests (field experience comes from the Python reference first) and not published on crates.io.
+Not included: TLS, names and stream patterns in the hub's participant list.
 
 | Part | Status |
 |---|---|
