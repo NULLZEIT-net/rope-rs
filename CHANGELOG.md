@@ -39,11 +39,16 @@ The wire protocol has its own number (`PROTOCOL_VERSION`, spec 14.5).
   a new generation). Messages with custody: only from the participant of the connection, stored before
   `MESSAGE_ACK`, delivered to every recipient on the list (`pending` → `delivered`), unknown recipients reported,
   `DELIVERY` to the sender until acknowledged; messages to the hub itself go to `HubOptions::on_message`, told again
-  after a restart if not taken (`retell`). Not yet: offline media.
+  after a restart if not taken (`retell`).
+- Hub, third part: offline media (`Hub::import_media`, `Hub::export_media`). Import takes bundles only from
+  participants on the list and messages only from the bundle's sender; streams of sources, receipts, delivery
+  acknowledgements, what consumers hold (`media_have.json`) and the repairs they ask for (`media_repairs.json`).
+  Export per participant: receipts and delivery reports, `ACK` and repair requests for a source, the pending messages,
+  and for a consumer the repairs it asked for (from the hub's verified copy) and the relayed streams from what it last
+  reported, `STREAM_END` only for streams verified at the hub.
 - The sending side (window, final check, block repair) is shared by source and hub (`sender`).
-- Conformance adapter (`rope-conformance-adapter`) and `conformance/run.py`: 53 of the 60 scenarios of the ROPE
-  conformance suite are required – every participant scenario (source and consumer over TCP and by offline media,
-  messages both ways, rejects, frame level) and every hub scenario over TCP (`start_hub`).
-- `tests/end_to_end.rs`: source, hub, consumer and recipient all in Rust.
+- Conformance adapter (`rope-conformance-adapter`) and `conformance/run.py`: **all 60 scenarios** of the ROPE
+  conformance suite are required – every role over TCP and by offline media, rejects, frame level.
+- `tests/end_to_end.rs`: source, hub, consumer and recipient all in Rust, over the network and by stick only.
 - Dependencies: `serde_json`, `crc32fast`, `sha2`, `flate2` (pure-Rust backend) – JSON, CRC-32, SHA-256 and zlib are
   not in the Rust standard library.

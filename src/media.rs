@@ -17,7 +17,9 @@
 
 use crate::frames::{self, kind, Frame};
 use crate::mailbox::new_id;
+use crate::meta;
 use crate::now_ms;
+use crate::sender::{differing_blocks, read_range, sha256_prefix};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
@@ -444,6 +446,92 @@ impl RepairRequest {
             .map(|i| self.sums.get(&i).cloned())
             .collect()
     }
+}
+
+// --- building blocks for exporters --------------------------------------------------------------------
+
+/// Adds the bytes `start`..`limit` of a file as SEGMENT frames, and STREAM_END if `final_size` is set and the stream
+/// is complete up to it. False when the medium is full.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn add_stream(
+    w: &mut BundleWriter,
+    name: &str,
+    gen: u64,
+    path: &Path,
+    start: u64,
+    limit: u64,
+    final_size: Option<u64>,
+    level: u32,
+) -> io::Result<bool> {
+    let mut off = start;
+    while off < limit {
+        let data = read_range(path, off, SEGMENT_BYTES.min(limit - off))?;
+        if data.is_empty() {
+            break;
+        }
+        if !w.add(&frames::segment(
+            name,
+            gen,
+            off,
+            &data,
+            now_ms(),
+            level,
+            false,
+        ))? {
+            return Ok(false);
+        }
+        w.report.segments += 1;
+        w.report.stream_bytes += data.len() as u64;
+        off += data.len() as u64;
+    }
+    if let Some(fin) = final_size {
+        if off >= fin {
+            let (digest, n) = sha256_prefix(path, fin)?;
+            let end = Frame::new(
+                kind::STREAM_END,
+                meta! {"stream" => name, "gen" => gen, "size" => n, "sha256" => digest},
+            );
+            if n == fin && !w.add(&end)? {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Resends the blocks of a file that differ from a receiver's sums as SEGMENT `repair` (spec 8.6, 14.7). Returns
+/// (fitted, differing blocks); `fitted` is false when the medium is full.
+pub(crate) fn add_repair(
+    w: &mut BundleWriter,
+    name: &str,
+    gen: u64,
+    path: &Path,
+    (size, block, sums): (u64, u64, &[String]),
+    level: u32,
+) -> io::Result<(bool, usize)> {
+    let diff = differing_blocks(path, block, sums, size)?;
+    for &(mut off, end) in &diff {
+        while off < end {
+            let data = read_range(path, off, SEGMENT_BYTES.min(end - off))?;
+            if data.is_empty() {
+                break;
+            }
+            if !w.add(&frames::segment(
+                name,
+                gen,
+                off,
+                &data,
+                now_ms(),
+                level,
+                true,
+            ))? {
+                return Ok((false, diff.len()));
+            }
+            w.report.repair_bytes += data.len() as u64;
+            off += data.len() as u64;
+        }
+    }
+    Ok((true, diff.len()))
 }
 
 /// Keys of streams with a gap in the bundle being imported: their later segments are skipped as well.

@@ -9,7 +9,8 @@ test of a protocol specification; this repository is the second one.
 
 ## Status
 
-Early development. **Not yet released.**
+Every role of the protocol is implemented and passes the whole conformance suite. **Not yet released**; not yet
+used outside tests (field experience comes from the Python reference first).
 
 | Part | Status |
 |---|---|
@@ -17,12 +18,11 @@ Early development. **Not yet released.**
 | Source (sends growing files to a hub) | done – resume, heartbeat, final check, block repair, new generations |
 | Messages with custody, recipient | done – exactly once, also through a breaking link and across restarts |
 | Consumer (receives relayed streams) | done – resume, final check, block repair at the consumer |
-| Offline media (sticks), media format 1 | done for source, consumer, recipient – bundles interchangeable with the reference, a stick too small, damaged bundles, block repair by stick |
-| Hub | over TCP done – participant list, rejects, one session per participant, streams of sources with block repair, relay to consumers, messages with custody and delivery reports; offline media follows |
+| Offline media (sticks), media format 1 | done for every role – bundles interchangeable with the reference, a stick too small, damaged bundles, block repair by stick |
+| Hub | done – participant list, rejects, one session per participant, streams of sources with block repair, relay to consumers, messages with custody and delivery reports, offline media |
 
-Conformance: **53 of the 60 scenarios** of the ROPE conformance suite pass – every scenario for the participant
-roles and every hub scenario over TCP; the other 7 test the hub's offline media. `tests/end_to_end.rs` runs source,
-hub, consumer and recipient all in Rust. The list is in `conformance/expected.txt` and is checked on every change.
+Conformance: **all 60 scenarios** of the ROPE conformance suite pass, for every role over TCP and by offline media.
+`tests/end_to_end.rs` runs source, hub, consumer and recipient all in Rust, over the network and by stick only. The list is in `conformance/expected.txt` and is checked on every change.
 
 ## Use
 

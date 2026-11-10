@@ -173,3 +173,101 @@ fn source_hub_consumer_and_messages_all_in_rust() {
     hub.stop();
     let _ = fs::remove_dir_all(dir);
 }
+
+#[test]
+fn by_stick_only_all_in_rust() {
+    // no network at all: participants point at a port where nothing listens
+    let dir = temp_dir();
+    let data: Vec<u8> = (0..2_500_000u32).map(|i| (i * 13 % 241) as u8).collect();
+    let file = dir.join("rec-0001.dat");
+    fs::write(&file, &data).unwrap();
+    let participants: BTreeMap<String, String> = [("source-1", "source"), ("c-1", "consumer")]
+        .iter()
+        .map(|(p, r)| (p.to_string(), r.to_string()))
+        .collect();
+    let opts = HubOptions {
+        port: 0,
+        heartbeat: Duration::from_millis(200),
+        timeout: Duration::from_secs(1),
+        ..HubOptions::default()
+    };
+    let mut hub = Hub::start(&dir.join("hub"), participants, "op-1", opts).unwrap();
+    let nowhere = "127.0.0.1:1";
+    let mut source = Source::start(
+        "source-1",
+        "op-1",
+        nowhere,
+        vec![("rec-0001.dat".into(), file)],
+        &dir.join("src"),
+        fast(None),
+    )
+    .unwrap();
+    let (at_consumer, consumer_cb) = counter();
+    let mut consumer = Consumer::start(
+        "c-1",
+        "op-1",
+        nowhere,
+        &dir.join("c"),
+        fast(Some(consumer_cb)),
+    )
+    .unwrap();
+    let stick = |n: u32| dir.join(format!("stick{}", n));
+
+    source.complete("rec-0001.dat");
+    let id = source
+        .send_message(&["c-1".into()], "task", b"look again at T07")
+        .unwrap();
+    let out = source.export_media(&stick(1), None).unwrap();
+    assert!(out.complete && out.stream_bytes == data.len() as u64 && out.messages == 1);
+    let reps = hub.import_media(&stick(1)).unwrap();
+    assert_eq!(reps.len(), 1);
+    assert!(reps[0].problems.is_empty(), "{:?}", reps[0].problems);
+    assert_eq!(
+        reps[0].checked,
+        vec![("rec-0001.dat".to_string(), 1, "ok".to_string())]
+    );
+
+    hub.export_media(&stick(2), "c-1", None).unwrap();
+    let reps = consumer.import_media(&stick(2)).unwrap();
+    assert!(reps[0].problems.is_empty(), "{:?}", reps[0].problems);
+    let got = consumer
+        .streams()
+        .into_iter()
+        .find(|s| s.stream == "source-1/rec-0001.dat")
+        .unwrap();
+    assert_eq!(got.verified.as_deref(), Some("ok"));
+    assert_eq!(fs::read(&got.path).unwrap(), data);
+    assert_eq!(
+        *at_consumer.lock().unwrap(),
+        vec![(id.clone(), b"look again at T07".to_vec())]
+    );
+
+    // receipts back: the hub learns the delivery, the source its delivery report and what the hub holds
+    consumer.export_media(&stick(3), None).unwrap();
+    hub.import_media(&stick(3)).unwrap();
+    hub.export_media(&stick(4), "source-1", None).unwrap();
+    let reps = source.import_media(&stick(4)).unwrap();
+    assert_eq!(
+        reps[0].acks,
+        vec![("rec-0001.dat".to_string(), 1, data.len() as u64)]
+    );
+    let sent = source
+        .outbox()
+        .into_iter()
+        .find(|m| m.message.id == id)
+        .unwrap();
+    assert!(sent.at_hub);
+    assert_eq!(
+        sent.report.unwrap()["delivered"],
+        serde_json::json!(["c-1"])
+    );
+    assert_eq!(
+        source.export_media(&stick(5), None).unwrap().stream_bytes,
+        0
+    ); // nothing to send again
+
+    consumer.stop();
+    source.stop();
+    hub.stop();
+    let _ = fs::remove_dir_all(dir);
+}
