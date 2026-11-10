@@ -29,8 +29,14 @@ The wire protocol has its own number (`PROTOCOL_VERSION`, spec 14.5).
   stream. `export_media` / `import_media` for source (from the hub's `ACK`, block repairs asked for in a bundle,
   a new generation if most blocks differ), consumer (`ACK`, repair requests) and recipient (messages, receipts,
   delivery reports).
-- Conformance adapter (`rope-conformance-adapter`) and `conformance/run.py`: 35 of the 60 scenarios of the ROPE
+- Hub, first part (`hub::Hub`): listens on the chosen port (refuses in plain language if it is taken, never another
+  one), checks every greeting against the participant list (`unknown_participant`, `wrong_operation`, `version`,
+  `role`), one session per participant (a new greeting replaces the old one), heartbeat and timeout sent in
+  `WELCOME` (timeout at least twice the heartbeat), streams of sources stored per participant with final check and
+  block repair, `ERROR` for bad frames, relayed names longer than 255 bytes refused. Not yet: relay to consumers,
+  messages, offline media.
+- Conformance adapter (`rope-conformance-adapter`) and `conformance/run.py`: 50 of the 60 scenarios of the ROPE
   conformance suite are required – every participant scenario (source and consumer over TCP and by offline media,
-  messages both ways, rejects, frame level).
+  messages both ways, rejects, frame level) and 15 for the hub (`start_hub`).
 - Dependencies: `serde_json`, `crc32fast`, `sha2`, `flate2` (pure-Rust backend) – JSON, CRC-32, SHA-256 and zlib are
   not in the Rust standard library.

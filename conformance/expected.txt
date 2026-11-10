@@ -34,7 +34,24 @@ frame_unknown_core_type
 frame_extension_ignored
 frame_reject_announced
 
-# offline media (participant roles; the hub_media_* scenarios need a hub)
+# the hub under test: sources over TCP, rejects, frame level (relay, messages and media follow)
+hub_from_source
+hub_from_source_disconnects
+hub_restart
+hub_repair
+hub_reject_unknown
+hub_reject_wrong_operation
+hub_reject_role
+hub_frame_first_not_hello
+hub_frame_bad_wrong_crc
+hub_frame_bad_wrong_magic
+hub_frame_bad_meta_too_long
+hub_frame_bad_meta_not_an_object
+hub_frame_bad_ack_without_committed
+hub_frame_unknown_core_type
+hub_frame_extension_ignored
+
+# offline media (participant roles; the hub_media_* scenarios need the hub's media part)
 media_source
 media_consumer
 media_message_to_adapter

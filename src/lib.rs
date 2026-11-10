@@ -7,6 +7,7 @@
 
 pub mod consumer;
 pub mod frames;
+pub mod hub;
 pub mod mailbox;
 pub mod media;
 pub mod participant;
